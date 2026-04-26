@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Callable, Optional, Union
 
 import jax.numpy as jnp
+from jax.nn import sigmoid
 
 from pyhgf.typing import NetworkState
 from pyhgf.updates.vectorized.binary import (
@@ -30,7 +31,11 @@ def propagation_step(
     add_constant_inputs: list[bool],
     lr: Union[float, str],
     layer_kinds: Optional[list[str]] = None,
-) -> tuple[NetworkState, tuple[NetworkState, jnp.ndarray]]:
+    adam_params: Optional[tuple[float, float, float, Optional[float]]] = None,
+    update_type: str = "eHGF",
+    volatility_parents: Optional[list[bool]] = None,
+    learning_kind: str = "precision_weighted",
+) -> tuple[NetworkState, jnp.ndarray]:
     """Single propagation step through the network.
 
     This performs a full inference-then-learning cycle for one data sample:
@@ -50,17 +55,31 @@ def propagation_step(
     add_constant_inputs :
         Per-layer flags indicating whether a bias term is added.
     lr :
-        Learning rate (float) or ``"dynamic"`` for Kalman-gain updates.
+        Learning rate: a non-negative float for direct scaling, or ``"adam"``
+        for the Adam optimiser.
     layer_kinds :
         Per-layer node type (``"volatile"`` or ``"binary"``).  Defaults to
         all ``"volatile"`` when *None*.
+    adam_params :
+        Tuple ``(beta1, beta2, epsilon, lr_override)`` for Adam optimiser.
+        ``lr_override`` is an optional Adam-specific learning rate that overrides the
+        main *lr* argument.  When *None*, Adam is not used.
+    volatility_parents :
+        Per-layer flag controlling whether the implied internal volatility parent
+        is active.  When ``True`` (default), mean_vol and precision_vol are
+        predicted and updated for that layer.  When ``False``, the volatility
+        level is frozen and only tonic_volatility determines the expected
+        precision.  Defaults to all ``True`` when *None*.
+    learning_kind :
+        Gradient computation mode passed to :func:`vectorized_weight_update`:
+        ``"standard"``, ``"precision_weighted"`` (default), or ``"dynamic"``.
 
     Returns
     -------
     new_state :
         Updated network state.
-    (new_state, output_pred) :
-        Carry-along tuple for ``jax.lax.scan`` compatibility.
+    output_pred :
+        Output layer prediction (expected mean).
     """
     x, y = inputs
     layers = list(state.layers)
@@ -72,6 +91,10 @@ def propagation_step(
     # Default: all volatile layers
     if layer_kinds is None:
         layer_kinds = ["volatile"] * n_layers
+
+    # Default: all layers have an implied volatility parent
+    if volatility_parents is None:
+        volatility_parents = [True] * n_layers
 
     # 1. Set predictors (top layer = input)
     layers[-1] = layers[-1]._replace(expected_mean=x, mean=x)
@@ -98,63 +121,88 @@ def propagation_step(
                 time_step=state.time_step,
                 coupling_fn=coupling_fns[i],
                 parent_has_constant=add_constant_inputs[i],
+                has_volatility_parent=volatility_parents[i - 1],
             )
 
     # Step 4a: PE for output layer (mean = y, observation-pinned)
-    # Exclude the bias column (if any) from the parent count.
-    n_parents_0 = weights[0].shape[1] - (1 if add_constant_inputs[1] else 0)
     if layer_kinds[0] == "binary":
         layers[0] = vectorized_binary_prediction_error(layer=layers[0])
     else:
         layers[0] = vectorized_layer_prediction_error(
             layer=layers[0],
-            n_parents=n_parents_0,
+            params=params[0],
+            update_type=update_type,
+            has_volatility_parent=volatility_parents[0],
         )
 
     # Step 4b: per hidden layer — posterior then PE (interleaved)
     for i in range(1, n_layers - 1):
-        # Real (non-constant) parent count for this layer
-        n_vp = weights[i].shape[1] - (1 if add_constant_inputs[i + 1] else 0)
         layers[i] = vectorized_layer_posterior_update(
             layer=layers[i],
             child=layers[i - 1],
             weights=weights[i - 1],
-            params=params[i],
             coupling_fn_grad=coupling_fn_grads[i],  # parent i's grad
-            n_value_parents=n_vp,
             parent_has_constant=add_constant_inputs[i],
         )
-        # Recompute PE using updated posterior mean so the layer
+        # Recompute PE and update volatility level so the layer
         # above receives the correct (post-posterior) error signal.
         if layer_kinds[i] == "binary":
             layers[i] = vectorized_binary_prediction_error(layer=layers[i])
         else:
             layers[i] = vectorized_layer_prediction_error(
                 layer=layers[i],
-                n_parents=n_vp,
+                params=params[i],
+                update_type=update_type,
+                has_volatility_parent=volatility_parents[i],
             )
 
     # ========== LEARNING PHASE (after inference converges) ==========
     # Update weights once using converged activities
-    lr_value: Optional[float] = None if lr == "dynamic" else float(lr)
+    use_adam = lr == "adam"
+    adam_t = state.adam_t + 1 if use_adam else state.adam_t
+
+    adam_m_list = list(state.adam_m)
+    adam_v_list = list(state.adam_v)
+
+    if adam_params is not None:
+        beta1, beta2, epsilon, _adam_lr_override = adam_params
+        _adam_lr = _adam_lr_override if _adam_lr_override is not None else 1e-3
+    else:
+        beta1, beta2, epsilon, _adam_lr = 0.9, 0.999, 1e-8, 1e-3
+
     for i in range(1, n_layers):
-        weights[i - 1] = vectorized_weight_update(
+        weights[i - 1], new_m, new_v = vectorized_weight_update(
             parent_state=layers[i],
             child_state=layers[i - 1],
             weights=weights[i - 1],
             coupling_fn=coupling_fns[i],
-            lr=lr_value,
+            kind=learning_kind,
+            lr=lr,
             parent_has_constant=add_constant_inputs[i],
+            child_is_binary=(layer_kinds[i - 1] == "binary"),
+            adam_m=adam_m_list[i - 1] if use_adam else None,
+            adam_v=adam_v_list[i - 1] if use_adam else None,
+            adam_t=adam_t,
+            adam_lr=_adam_lr,
+            adam_beta1=beta1,
+            adam_beta2=beta2,
+            adam_epsilon=epsilon,
         )
+        if use_adam and new_m is not None:
+            adam_m_list[i - 1] = new_m
+            adam_v_list[i - 1] = new_v
 
     new_state = NetworkState(
         layers=tuple(layers),
         weights=tuple(weights),
         params=tuple(params),
         time_step=state.time_step,
+        adam_m=tuple(adam_m_list),
+        adam_v=tuple(adam_v_list),
+        adam_t=adam_t,
     )
 
     # Return output prediction for monitoring
     output_pred = layers[0].expected_mean
 
-    return new_state, (new_state, output_pred)
+    return new_state, output_pred

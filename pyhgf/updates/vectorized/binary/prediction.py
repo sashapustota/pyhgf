@@ -47,9 +47,9 @@ def vectorized_binary_prediction(
     parent_state :
         Current state of the parent layer (predictor).
     weights :
-        Weight matrix connecting child to parent, shape
-        ``(n_children, n_parents)`` or ``(n_children, n_parents + 1)``
-        when the parent layer includes a constant input node.
+        Weight matrix connecting child to parent, shape ``(n_children, n_parents)`` or
+        ``(n_children, n_parents + 1)`` when the parent layer includes a constant input
+        node.
     coupling_fn :
         Coupling function applied to parent means (default: tanh).
     parent_has_constant :
@@ -66,7 +66,6 @@ def vectorized_binary_prediction(
     if parent_has_constant:
         parent_mean = jnp.concatenate([parent_mean, jnp.ones(1)])
 
-    # Weighted sum of coupled parent means
     coupled_parents = coupling_fn(parent_mean)
     logit = jnp.matmul(weights, coupled_parents)
 

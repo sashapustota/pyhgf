@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from jax import jit
 from jax.nn import sigmoid
 
-from pyhgf.math import smoothed_rectangular
+from pyhgf.math import lambert_w0
 from pyhgf.typing import Edges
 
 
@@ -21,28 +21,19 @@ def continuous_node_posterior_update_unbounded(
     attributes :
         The attributes of the probabilistic nodes.
     node_idx :
-        Pointer to the node that needs to be updated. After continuous updates, the
-        parameters of value and volatility parents (if any) will be different.
+        Pointer to the node that needs to be updated.
     edges :
-        The edges of the probabilistic nodes as a tuple of
-        :py:class:`pyhgf.typing.Indexes`. The tuple has the same length as node number.
-        For each node, the index list value and volatility parents and children.
+        The edges of the probabilistic nodes.
 
     Returns
     -------
     attributes :
         The updated attributes of the probabilistic nodes.
-
-    See Also
-    --------
-    continuous_node_posterior_update_ehgf
-
     """
     posterior_precision, posterior_mean = posterior_update_unbounded(
         attributes=attributes, node_idx=node_idx, edges=edges
     )
 
-    # update the posterior mean and precision using the unbounded update step
     attributes[node_idx]["precision"] = posterior_precision
     attributes[node_idx]["mean"] = posterior_mean
 
@@ -53,150 +44,116 @@ def continuous_node_posterior_update_unbounded(
 def posterior_update_unbounded(
     attributes: dict, node_idx: int, edges: Edges, **args
 ) -> tuple[float, float]:
-    """Update the posterior of a continuous node with unbounded quadratic approximation.
+    """Compute unbounded posterior for a continuous volatility-parent node.
 
     Parameters
     ----------
     attributes :
         The attributes of the probabilistic nodes.
     node_idx :
-        Pointer to the node that needs to be updated. After continuous updates, the
-        parameters of value and volatility parents (if any) will be different.
+        Pointer to the node that needs to be updated.
     edges :
-        The edges of the probabilistic nodes as a tuple of
-        :py:class:`pyhgf.typing.Indexes`. The tuple has the same length as node number.
-        For each node, the index list value and volatility parents and children.
+        The edges of the probabilistic nodes.
 
     Returns
     -------
-    attributes :
-        The updated attributes of the probabilistic nodes.
-
-    See Also
-    --------
-    continuous_node_posterior_update_ehgf
-
+    posterior_precision, posterior_mean :
+        Updated precision and mean of the node.
     """
     volatility_child_idx = edges[node_idx].volatility_children[0]  # type: ignore
+    t_k = attributes[-1]["time_step"]
 
-    # # Recover the precision of the child node at the previous time step --------------
-    previous_child_variance = attributes[volatility_child_idx]["temp"][
-        "current_variance"
-    ]
+    ka = attributes[node_idx]["volatility_coupling_children"][0]
+    om = attributes[volatility_child_idx]["tonic_volatility"]
 
-    # ----------------------------------------------------------------------------------
-    # First quadratic approximation L1 -------------------------------------------------
-    # ----------------------------------------------------------------------------------
+    al_aux = jnp.maximum(
+        attributes[volatility_child_idx]["temp"]["current_variance"], 1e-128
+    )  # 1/pi_prev_jm1
+    be_aux = (1.0 / attributes[volatility_child_idx]["precision"]) + (
+        attributes[volatility_child_idx]["mean"]
+        - attributes[volatility_child_idx]["expected_mean"]
+    ) ** 2
 
-    # Instead of computing exp(x) / (v + exp(x)) directly as in the equations, we use a
-    # numerically stable form with w = 1 / (1 + v * exp(-x)) = sigmoid(x - log(v))
-    x = (
-        attributes[node_idx]["volatility_coupling_children"][0]
-        * attributes[node_idx]["expected_mean"]
-        + attributes[volatility_child_idx]["tonic_volatility"]
-    )
-    previous_child_variance = jnp.maximum(previous_child_variance, 1e-128)
-    w_child = sigmoid(x - jnp.log(previous_child_variance))
+    muhat_j = attributes[node_idx]["expected_mean"]
+    pihat_j = attributes[node_idx]["expected_precision"]
 
-    delta_child = (
-        (1 / attributes[volatility_child_idx]["precision"])
-        + (
-            attributes[volatility_child_idx]["mean"]
-            - (attributes[volatility_child_idx]["expected_mean"])
-        )
-        ** 2
-    ) / (previous_child_variance + jnp.exp(jnp.clip(x, a_min=-80.0, a_max=80.0))) - 1.0
+    # Canonical exponent at prediction: y = log(t_k) + ka*muhat_j + om
+    gamma_c = jnp.log(t_k) + ka * muhat_j + om
 
-    pi_l1 = attributes[node_idx]["expected_precision"] + 0.5 * attributes[node_idx][
-        "volatility_coupling_children"
-    ][0] ** 2 * w_child * (1 - w_child)
+    # Recompute v and w using muhat_j. The w formula is written as
+    # 1/(1 + al_aux/v) so it stays finite when v_jm1 overflows to ∞ (→ 1).
+    v_jm1 = jnp.exp(gamma_c)
+    w_jm1 = 1.0 / (1.0 + al_aux / v_jm1)
 
-    mu_l1 = (
-        attributes[node_idx]["expected_mean"]
-        + (
-            (attributes[node_idx]["volatility_coupling_children"][0] * w_child)
-            / (2 * pi_l1)
-        )
-        * delta_child
-    )
+    # Volatility prediction error: da_jm1 = pihat_jm1 * be_aux - 1, with
+    # pihat_jm1 = child's expected_precision (set in the prediction step at
+    # mu_prev_j).
+    da_jm1 = attributes[volatility_child_idx]["expected_precision"] * be_aux - 1.0
 
     # ----------------------------------------------------------------------------------
-    # Second quadratic approximation L2 ------------------------------------------------
+    # Expansion 1: quadratic at the prediction (prior mean)
     # ----------------------------------------------------------------------------------
-    phi = jnp.log(previous_child_variance * (2 + jnp.sqrt(3)))
-
-    w_phi = jnp.exp(
-        attributes[node_idx]["volatility_coupling_children"][0] * phi
-        + attributes[volatility_child_idx]["tonic_volatility"]
-    ) / (
-        previous_child_variance
-        + jnp.exp(
-            attributes[node_idx]["volatility_coupling_children"][0] * phi
-            + attributes[volatility_child_idx]["tonic_volatility"]
-        )
-    )
-
-    delta_phi = (
-        (1 / attributes[volatility_child_idx]["precision"])
-        + (
-            attributes[volatility_child_idx]["mean"]
-            - (attributes[volatility_child_idx]["expected_mean"])
-        )
-        ** 2
-    ) / (
-        previous_child_variance
-        + jnp.exp(
-            attributes[node_idx]["volatility_coupling_children"][0] * phi
-            + attributes[volatility_child_idx]["tonic_volatility"]
-        )
-    ) - 1.0
-
-    pi_l2 = attributes[node_idx]["expected_precision"] + 0.5 * attributes[node_idx][
-        "volatility_coupling_children"
-    ][0] ** 2 * w_phi * (w_phi + (2 * w_phi - 1) * delta_phi)
-
-    mu_hat_phi = ((2.0 * pi_l2 - 1.0) * phi + attributes[node_idx]["expected_mean"]) / (
-        2.0 * pi_l2
-    )
-
-    mu_l2 = (
-        mu_hat_phi
-        + (
-            (attributes[node_idx]["volatility_coupling_children"][0] * w_phi)
-            / (2 * pi_l2)
-        )
-        * delta_phi
-    )
+    pi1 = pihat_j + 0.5 * ka**2 * w_jm1 * (1.0 - w_jm1)
+    mu1 = muhat_j + (ka * w_jm1 / (2.0 * pi1)) * da_jm1
 
     # ----------------------------------------------------------------------------------
-    # compute the full quadratic approximation -----------------------------------------
+    # Expansion 2: quadratic at the Lambert W0 approximate mode
     # ----------------------------------------------------------------------------------
-    theta_l = jnp.sqrt(
-        1.2
-        * (
-            (
-                (1 / attributes[volatility_child_idx]["precision"])
-                + (
-                    attributes[volatility_child_idx]["mean"]
-                    - attributes[volatility_child_idx]["expected_mean"]
-                )
-                ** 2
-            )
-            / (previous_child_variance * pi_l1)
-        )
+    pihat_y = pihat_j / ka**2
+
+    # Compute W_arg in log-space and cap at log(float_max) — matches MATLAB's
+    # "W_arg = exp(min(log_W_arg, log(realmax)))".
+    log_W_arg = jnp.log(be_aux) - jnp.log(2.0 * pihat_y) + 0.5 / pihat_y - gamma_c
+    log_float_max = jnp.log(jnp.finfo(jnp.result_type(log_W_arg)).max)
+    W_arg = jnp.exp(jnp.minimum(log_W_arg, log_float_max))
+    v_W = lambert_w0(W_arg)
+    y_star = gamma_c + v_W - 0.5 / pihat_y
+    x_star = (y_star - jnp.log(t_k) - om) / ka
+
+    # Rearranged w/da formulas stay finite when s2 overflows (→ w=1, da=-1).
+    s2 = t_k * jnp.exp(ka * x_star + om)
+    w2 = 1.0 / (1.0 + al_aux / s2)
+    da2 = be_aux / (al_aux + s2) - 1.0
+
+    pi2_full = pihat_j + 0.5 * ka**2 * w2 * (w2 + (2.0 * w2 - 1.0) * da2)
+    pi2_safe = jnp.where(
+        pi2_full <= 0.0,
+        pihat_j + 0.5 * ka**2 * w2 * (1.0 - w2),
+        pi2_full,
+    )
+    mu2_safe = x_star + (0.5 * ka * w2 * da2 - pihat_j * (x_star - muhat_j)) / pi2_safe
+
+    # Fall back to Expansion 1 if Expansion 2 yields non-finite results —
+    # matches MATLAB: "if ~isfinite(pi2) || ~isfinite(mu2), pi2 = pi1; mu2 = mu1".
+    exp2_finite = jnp.isfinite(pi2_safe) & jnp.isfinite(mu2_safe)
+    pi2 = jnp.where(exp2_finite, pi2_safe, pi1)
+    mu2 = jnp.where(exp2_finite, mu2_safe, mu1)
+
+    # ----------------------------------------------------------------------------------
+    # Variational energy-based softmax blend (direct form, matches MATLAB)
+    # ----------------------------------------------------------------------------------
+    ey1 = t_k * jnp.exp(ka * mu1 + om)
+    I1 = (
+        -0.5 * jnp.log(al_aux + ey1)
+        - 0.5 * be_aux / (al_aux + ey1)
+        - 0.5 * pihat_j * (mu1 - muhat_j) ** 2
     )
 
-    # compute the weigthing of the two approximations
-    # using the smoothed rectangular function b
-    weigthing = smoothed_rectangular(
-        x=attributes[node_idx]["expected_mean"],
-        theta_l=theta_l,
-        phi_l=8.0,
-        theta_r=0.0,
-        phi_r=1.0,
+    ey2 = t_k * jnp.exp(ka * mu2 + om)
+    I2 = (
+        -0.5 * jnp.log(al_aux + ey2)
+        - 0.5 * be_aux / (al_aux + ey2)
+        - 0.5 * pihat_j * (mu2 - muhat_j) ** 2
     )
 
-    posterior_precision = (1 - weigthing) * pi_l1 + weigthing * pi_l2
-    posterior_mean = (1 - weigthing) * mu_l1 + weigthing * mu_l2
+    # Stable sigmoid matches b = 1/(1 + exp(I1 - I2)) without NaN at ±∞.
+    b = sigmoid(I2 - I1)
+
+    # ----------------------------------------------------------------------------------
+    # Gaussian mixture moment matching
+    # ----------------------------------------------------------------------------------
+    posterior_mean = (1.0 - b) * mu1 + b * mu2
+    sig2 = (1.0 - b) / pi1 + b / pi2 + b * (1.0 - b) * (mu1 - mu2) ** 2
+    posterior_precision = 1.0 / sig2
 
     return posterior_precision, posterior_mean

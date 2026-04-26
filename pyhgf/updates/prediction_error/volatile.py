@@ -4,14 +4,16 @@ from jax import jit
 
 from pyhgf.typing import Edges
 from pyhgf.updates.posterior.volatile import (
-    volatile_node_posterior_update,
     volatile_node_posterior_update_ehgf,
     volatile_node_posterior_update_unbounded,
+    volatile_node_volatility_posterior_update_standard,
 )
 
 
-@partial(jit, static_argnames=("node_idx",))
-def volatile_node_value_prediction_error(attributes: dict, node_idx: int) -> dict:
+@partial(jit, static_argnames=("node_idx", "edges"))
+def volatile_node_value_prediction_error(
+    attributes: dict, node_idx: int, edges: "Edges | None" = None
+) -> dict:
     """Compute the value prediction error of the value level.
 
     This is used by external value parents (if any).
@@ -20,10 +22,6 @@ def volatile_node_value_prediction_error(attributes: dict, node_idx: int) -> dic
     value_prediction_error = (
         attributes[node_idx]["mean"] - attributes[node_idx]["expected_mean"]
     )
-
-    # Divide by number of value parents (if any)
-    if attributes[node_idx]["value_coupling_parents"] is not None:
-        value_prediction_error /= len(attributes[node_idx]["value_coupling_parents"])
 
     attributes[node_idx]["temp"]["value_prediction_error"] = value_prediction_error
 
@@ -48,9 +46,6 @@ def volatile_node_volatility_prediction_error(attributes: dict, node_idx: int) -
         - 1
     )
 
-    # This is internal coupling (always 1 volatility "parent")
-    # No division needed
-
     attributes[node_idx]["temp"]["volatility_prediction_error"] = (
         volatility_prediction_error
     )
@@ -71,7 +66,7 @@ def volatile_node_prediction_error(
     # ----------------------------------------------------------------------------------
 
     # value prediction error
-    attributes = volatile_node_value_prediction_error(attributes, node_idx)
+    attributes = volatile_node_value_prediction_error(attributes, node_idx, edges)
 
     # volatility prediction error
     attributes = volatile_node_volatility_prediction_error(attributes, node_idx)
@@ -87,8 +82,8 @@ def volatile_node_prediction_error(
             attributes=attributes, edges=edges, node_idx=node_idx
         )
     elif update_type == "standard":
-        attributes = volatile_node_posterior_update(
-            attributes=attributes, edges=edges, node_idx=node_idx
+        attributes = volatile_node_volatility_posterior_update_standard(
+            attributes=attributes, node_idx=node_idx
         )
 
     return attributes

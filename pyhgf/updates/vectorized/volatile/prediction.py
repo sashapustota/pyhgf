@@ -18,6 +18,7 @@ def vectorized_layer_prediction(
     time_step: float,
     coupling_fn: Callable = jnp.tanh,
     parent_has_constant: bool = False,
+    has_volatility_parent: bool = True,
 ) -> LayerState:
     """Predict expected mean/precision for all nodes in child layer (volatile node).
 
@@ -44,47 +45,45 @@ def vectorized_layer_prediction(
         If True, the parent layer has a constant input node (mean = 1.0)
         appended to its activations.  The last column of *weights*
         carries the bias connections.
+    has_volatility_parent :
+        If True (default), the layer has an implied internal volatility parent
+        whose state (mean_vol, precision_vol) is predicted and updated.
+        If False, the volatility level is frozen: mean_vol and precision_vol
+        are not propagated forward, and only tonic_volatility drives the
+        expected precision for the value level.
 
     Returns
     -------
     LayerState
         Updated child layer state with expected values filled in.
     """
-    # 1. VOLATILITY LEVEL PREDICTION (internal)
-    # Expected mean for volatility level (autoconnection = 1.0)
-    expected_mean_vol = child_state.mean_vol
+    # 1. VOLATILITY LEVEL PREDICTION (internal) ----------------------------------------
+    # ----------------------------------------------------------------------------------
+    if has_volatility_parent:
+        # Expected mean for volatility level (autoconnection = 1.0)
+        expected_mean_vol = child_state.mean_vol
 
-    # Predicted volatility for volatility level
-    predicted_volatility_vol = time_step * jnp.exp(
-        jnp.clip(params.tonic_volatility_vol, a_min=-80.0, a_max=80.0)
-    )
-    predicted_volatility_vol = jnp.maximum(predicted_volatility_vol, 1e-128)
+        # Predicted volatility for volatility level
+        predicted_volatility_vol = time_step * jnp.exp(params.tonic_volatility_vol)
+        predicted_volatility_vol = jnp.where(
+            predicted_volatility_vol > 1e-128, predicted_volatility_vol, jnp.nan
+        )
 
-    # Expected precision for volatility level
-    expected_precision_vol = 1.0 / (
-        1.0 / child_state.precision_vol + predicted_volatility_vol
-    )
+        # Expected precision for volatility level
+        expected_precision_vol = 1.0 / (
+            1.0 / child_state.precision_vol + predicted_volatility_vol
+        )
 
-    # Effective precision for volatility level
-    effective_precision_vol = predicted_volatility_vol * expected_precision_vol
+        # Effective precision for volatility level
+        effective_precision_vol = predicted_volatility_vol * expected_precision_vol
+    else:
+        # Volatility level is frozen — pass through current values unchanged
+        expected_mean_vol = child_state.mean_vol
+        expected_precision_vol = child_state.precision_vol
+        effective_precision_vol = child_state.effective_precision_vol
 
-    # 2. VALUE LEVEL PREDICTION (external)
-    # Total volatility includes contribution from internal volatility level
-    total_volatility = (
-        params.tonic_volatility + params.volatility_coupling * expected_mean_vol
-    )
-
-    # Predicted volatility for value level
-    predicted_volatility = time_step * jnp.exp(
-        jnp.clip(total_volatility, a_min=-80.0, a_max=80.0)
-    )
-    predicted_volatility = jnp.maximum(predicted_volatility, 1e-128)
-
-    # Expected precision for value level
-    expected_precision = 1.0 / (1.0 / child_state.precision + predicted_volatility)
-
-    # Effective precision for value level
-    effective_precision = predicted_volatility * expected_precision
+    # 2. VALUE LEVEL PREDICTION (external) ---------------------------------------------
+    # ----------------------------------------------------------------------------------
 
     # Mean prediction via matrix multiply
     # weights shape: (n_children, n_parents) or (n_children, n_parents + 1)
@@ -100,6 +99,27 @@ def vectorized_layer_prediction(
     # Note: autoconnection_strength = 0 for i.i.d. classification
     # (the previous observation should not bias the next prediction)
     expected_mean = time_step * drift
+
+    if has_volatility_parent:
+        # Total volatility includes contribution from internal volatility level
+        total_volatility = (
+            params.tonic_volatility + params.volatility_coupling * expected_mean_vol
+        )
+    else:
+        # Only tonic volatility — no mean_vol contribution
+        total_volatility = params.tonic_volatility
+
+    # Predicted volatility for value level
+    predicted_volatility = time_step * jnp.exp(total_volatility)
+    predicted_volatility = jnp.where(
+        predicted_volatility > 1e-128, predicted_volatility, jnp.nan
+    )
+
+    # Expected precision for value level
+    expected_precision = 1.0 / (1.0 / child_state.precision + predicted_volatility)
+
+    # Effective precision for value level
+    effective_precision = predicted_volatility * expected_precision
 
     return child_state._replace(
         expected_mean=expected_mean,

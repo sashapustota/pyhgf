@@ -5,7 +5,7 @@ import numpy as np
 from pytest import raises
 
 from pyhgf import load_data
-from pyhgf.model import HGF, DeepNetwork, Network
+from pyhgf.model import HGF, Network
 from pyhgf.response import total_gaussian_surprise
 from pyhgf.typing import UpdateSequence
 
@@ -84,6 +84,22 @@ def test_network():
     # expected error for invalid type
     with raises(Exception):
         custom_hgf.add_nodes(kind="error")
+
+
+def test_constant_state_nodes_reject_invalid_parent_links():
+    """Constant-state nodes must not be children of any other node."""
+    net = Network().add_nodes(kind="volatile-state")
+    net = net.add_nodes(kind="constant-state", value_children=0)
+
+    with raises(ValueError, match="Constant-state nodes cannot have parents"):
+        net.add_nodes(kind="volatile-state", value_children=1)
+
+    with raises(
+        ValueError, match="Constant-state nodes cannot have volatility children"
+    ):
+        Network().add_nodes(kind="volatile-state").add_nodes(
+            kind="constant-state", volatility_children=0
+        )
 
 
 def test_continuous_hgf():
@@ -203,3 +219,135 @@ def test_custom_sequence():
         branches_idx=branches_idx,
         input_data=u,
     )
+
+
+def test_network_adam_optimizer():
+    """Test Network.fit() with Adam optimizer covers learning.py Adam branch."""
+    n_targets, n_hidden, n_input = 2, 3, 1
+
+    net = (
+        Network()
+        .add_nodes(kind="continuous-state", n_nodes=n_targets)
+        .add_nodes(
+            kind="volatile-state",
+            n_nodes=n_hidden,
+            value_children=list(range(n_targets)),
+        )
+        .add_nodes(
+            kind="volatile-state",
+            n_nodes=n_input,
+            value_children=list(range(n_targets, n_targets + n_hidden)),
+        )
+    )
+
+    x_idxs = tuple(range(n_targets + n_hidden, n_targets + n_hidden + n_input))
+    y_idxs = tuple(range(n_targets))
+
+    np.random.seed(42)
+    x = np.random.randn(5, n_input)
+    y = np.random.randn(5, n_targets)
+
+    net.fit(
+        x=x,
+        y=y,
+        inputs_x_idxs=x_idxs,
+        inputs_y_idxs=y_idxs,
+        lr="adam",
+    )
+
+    assert net.last_attributes is not None
+    # Adam state should have been initialised
+    assert "adam_m" in net.attributes[n_targets]
+    assert "adam_t" in net.attributes[-1]
+
+
+def test_network_fit_record_trajectories():
+    """Test Network.fit() with record_trajectories=True."""
+    n_targets, n_hidden, n_input = 2, 3, 1
+
+    net = (
+        Network()
+        .add_nodes(kind="continuous-state", n_nodes=n_targets)
+        .add_nodes(
+            kind="volatile-state",
+            n_nodes=n_hidden,
+            value_children=list(range(n_targets)),
+        )
+        .add_nodes(
+            kind="volatile-state",
+            n_nodes=n_input,
+            value_children=list(range(n_targets, n_targets + n_hidden)),
+        )
+    )
+
+    x_idxs = tuple(range(n_targets + n_hidden, n_targets + n_hidden + n_input))
+    y_idxs = tuple(range(n_targets))
+
+    np.random.seed(42)
+    x = np.random.randn(5, n_input)
+    y = np.random.randn(5, n_targets)
+
+    net.fit(
+        x=x,
+        y=y,
+        inputs_x_idxs=x_idxs,
+        inputs_y_idxs=y_idxs,
+        lr=0.1,
+        record_trajectories=True,
+    )
+
+    assert net.node_trajectories is not None
+
+
+def test_network_predict():
+    """Test Network.predict() method."""
+    n_targets, n_hidden, n_input = 2, 3, 1
+
+    net = (
+        Network()
+        .add_nodes(kind="continuous-state", n_nodes=n_targets)
+        .add_nodes(
+            kind="volatile-state",
+            n_nodes=n_hidden,
+            value_children=list(range(n_targets)),
+        )
+        .add_nodes(
+            kind="volatile-state",
+            n_nodes=n_input,
+            value_children=list(range(n_targets, n_targets + n_hidden)),
+        )
+    )
+
+    x_idxs = tuple(range(n_targets + n_hidden, n_targets + n_hidden + n_input))
+    y_idxs = tuple(range(n_targets))
+
+    np.random.seed(42)
+    x = np.random.randn(5, n_input)
+    y = np.random.randn(5, n_targets)
+
+    net.fit(x=x, y=y, inputs_x_idxs=x_idxs, inputs_y_idxs=y_idxs, lr=0.1)
+
+    preds = net.predict(
+        x=np.array([[0.5]]),
+        inputs_x_idxs=x_idxs,
+        inputs_y_idxs=y_idxs,
+    )
+    assert np.all(np.isfinite(np.asarray(preds)))
+
+
+def test_network_input_data_no_trajectories():
+    """Test Network.input_data() with record_trajectories=False."""
+    timeserie = load_data("continuous")
+
+    hgf = HGF(
+        n_levels=2,
+        model_type="continuous",
+        initial_mean={"1": 1.04, "2": 1.0},
+        initial_precision={"1": 1e4, "2": 1e1},
+        tonic_volatility={"1": -13.0, "2": -2.0},
+        tonic_drift={"1": 0.0, "2": 0.0},
+        volatility_coupling={"1": 1.0},
+    ).input_data(input_data=timeserie, record_trajectories=False)
+
+    assert hgf.node_trajectories is None
+    assert hgf.last_attributes is not None

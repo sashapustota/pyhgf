@@ -1,23 +1,21 @@
 use crate::model::Network;
 
-/// Sigmoid function: 1 / (1 + exp(-x))
-fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-/// Parametrised sigmoid: sigmoid(phi * (x - theta))
-fn s_func(x: f64, theta: f64, phi: f64) -> f64 {
-    sigmoid(phi * (x - theta))
-}
-
-/// Smoothed rectangular weighting function b
-fn b_func(x: f64, theta_l: f64, phi_l: f64, theta_r: f64, phi_r: f64) -> f64 {
-    s_func(x, theta_l, phi_l) * (1.0 - s_func(x, theta_r, phi_r))
+/// Principal branch of the Lambert W function for z >= 0.
+/// Solves w * exp(w) = z via 6 Halley iterations.
+fn lambert_w0(z: f64) -> f64 {
+    let mut w = (z + 1.0).ln();
+    for _ in 0..6 {
+        let ew = w.exp();
+        let f = w * ew - z;
+        let f1 = (w + 1.0) * ew;
+        let f2 = (w + 2.0) * ew;
+        w -= (2.0 * f * f1) / (2.0 * f1 * f1 - f * f2);
+    }
+    w
 }
 
 /// Compute value and volatility prediction errors for a volatile state node.
 fn compute_volatile_prediction_errors(network: &mut Network, node_idx: usize) {
-    let n_value_parents = network.edges[node_idx].value_parents.as_ref().map(|vp| vp.len());
     let n_volatility_parents = network.edges[node_idx].volatility_parents.as_ref().map(|vp| vp.len());
 
     let mean = network.attributes.states[node_idx].mean;
@@ -26,10 +24,7 @@ fn compute_volatile_prediction_errors(network: &mut Network, node_idx: usize) {
     let expected_precision = network.attributes.states[node_idx].expected_precision;
 
     // Value prediction error: δ = μ - μ̂
-    let mut value_prediction_error = mean - expected_mean;
-    if let Some(n) = n_value_parents {
-        value_prediction_error /= n as f64;
-    }
+    let value_prediction_error = mean - expected_mean;
     
     // Volatility prediction error (internal coupling, no division)
     let mut volatility_prediction_error =
@@ -113,56 +108,85 @@ pub fn prediction_error_volatile_state_node_ehgf(network: &mut Network, node_idx
 // Unbounded: prediction error + volatility level posterior update
 // =============================================================================
 
-pub fn prediction_error_volatile_state_node_unbounded(network: &mut Network, node_idx: usize, _time_step: f64) {
+pub fn prediction_error_volatile_state_node_unbounded(network: &mut Network, node_idx: usize, time_step: f64) {
     compute_volatile_prediction_errors(network, node_idx);
 
-    let (precision_vol, mean_vol) = unbounded_volatility_level_update(network, node_idx);
+    let (precision_vol, mean_vol) = unbounded_volatility_level_update(network, node_idx, time_step);
     network.attributes.states[node_idx].precision_vol = precision_vol;
     network.attributes.states[node_idx].mean_vol = mean_vol;
 }
 
-fn unbounded_volatility_level_update(network: &Network, node_idx: usize) -> (f64, f64) {
+fn unbounded_volatility_level_update(network: &Network, node_idx: usize, time_step: f64) -> (f64, f64) {
     let s = &network.attributes.states[node_idx];
-    let expected_mean_vol = s.expected_mean_vol;
-    let expected_precision_vol = s.expected_precision_vol;
-    let volatility_coupling = s.volatility_coupling_internal;
-    let tonic_volatility = s.tonic_volatility;
+    let muhat_j = s.expected_mean_vol;
+    let pihat_j = s.expected_precision_vol;
+    let ka = s.volatility_coupling_internal;
+    let om = s.tonic_volatility;
     let mean = s.mean;
     let expected_mean = s.expected_mean;
     let precision = s.precision;
-    let previous_child_variance = s.current_variance.max(1e-128);
+    let al_aux = s.current_variance.max(1e-128); // 1/pi_prev_jm1
+    let be_aux = (1.0 / precision) + (mean - expected_mean).powi(2);
 
-    let numerator = (1.0 / precision) + (mean - expected_mean).powi(2);
+    // Canonical exponent at prediction: y = log(t_k) + ka*muhat_j + om
+    let gamma_c = time_step.ln() + ka * muhat_j + om;
 
-    // First quadratic approximation L1
-    let x = volatility_coupling * expected_mean_vol + tonic_volatility;
-    let w_child = sigmoid(x - previous_child_variance.ln());
+    // Recompute v and w using muhat_j. w is written as 1/(1 + al_aux/v) so
+    // it stays finite when v_jm1 overflows to +inf (→ 1), matching Julia.
+    let v_jm1 = gamma_c.exp();
+    let w_jm1 = 1.0 / (1.0 + al_aux / v_jm1);
+    let da_jm1 = be_aux / (al_aux + v_jm1) - 1.0;
 
-    let exp_x_clamped = x.clamp(-80.0, 80.0).exp();
-    let delta_child = numerator / (previous_child_variance + exp_x_clamped) - 1.0;
+    // Expansion 1: quadratic at the prediction (prior mean)
+    let pi1 = pihat_j + 0.5 * ka.powi(2) * w_jm1 * (1.0 - w_jm1);
+    let mu1 = muhat_j + (ka * w_jm1 / (2.0 * pi1)) * da_jm1;
 
-    let pi_l1 = expected_precision_vol
-        + 0.5 * volatility_coupling.powi(2) * w_child * (1.0 - w_child);
-    let mu_l1 = expected_mean_vol
-        + (volatility_coupling * w_child / (2.0 * pi_l1)) * delta_child;
+    // Expansion 2: quadratic at the Lambert W0 approximate mode.
+    // W_arg is computed in log-space and capped at log(f64::MAX) to match the
+    // MATLAB reference: W_arg = exp(min(log_W_arg, log(realmax))).
+    let pihat_y = pihat_j / ka.powi(2);
+    let log_w_arg = be_aux.ln() - (2.0 * pihat_y).ln() + 0.5 / pihat_y - gamma_c;
+    let w_arg = log_w_arg.min(f64::MAX.ln()).exp();
+    let v_w = lambert_w0(w_arg);
+    let y_star = gamma_c + v_w - 0.5 / pihat_y;
+    let x_star = (y_star - time_step.ln() - om) / ka;
 
-    // Second quadratic approximation L2
-    let phi = (previous_child_variance * (2.0 + 3.0_f64.sqrt())).ln();
-    let exp_kappa_phi = (volatility_coupling * phi + tonic_volatility).clamp(-80.0, 80.0).exp();
-    let w_phi = exp_kappa_phi / (previous_child_variance + exp_kappa_phi);
-    let delta_phi = numerator / (previous_child_variance + exp_kappa_phi) - 1.0;
+    // Rearranged w/da formulas stay finite when s2 overflows (→ w=1, da=-1).
+    let s2 = time_step * (ka * x_star + om).exp();
+    let w2 = 1.0 / (1.0 + al_aux / s2);
+    let da2 = be_aux / (al_aux + s2) - 1.0;
 
-    let pi_l2 = expected_precision_vol
-        + 0.5 * volatility_coupling.powi(2) * w_phi * (w_phi + (2.0 * w_phi - 1.0) * delta_phi);
-    let mu_hat_phi = ((2.0 * pi_l2 - 1.0) * phi + expected_mean_vol) / (2.0 * pi_l2);
-    let mu_l2 = mu_hat_phi + (volatility_coupling * w_phi / (2.0 * pi_l2)) * delta_phi;
+    let pi2_full = pihat_j + 0.5 * ka.powi(2) * w2 * (w2 + (2.0 * w2 - 1.0) * da2);
+    let pi2_safe = if pi2_full <= 0.0 {
+        pihat_j + 0.5 * ka.powi(2) * w2 * (1.0 - w2)
+    } else {
+        pi2_full
+    };
+    let mu2_safe = x_star + (0.5 * ka * w2 * da2 - pihat_j * (x_star - muhat_j)) / pi2_safe;
 
-    // Full quadratic approximation
-    let theta_l = (1.2 * numerator / (previous_child_variance * pi_l1)).sqrt();
-    let weighting = b_func(expected_mean_vol, theta_l, 8.0, 0.0, 1.0);
+    // Fall back to Expansion 1 if Expansion 2 yields non-finite results —
+    // matches MATLAB: "if ~isfinite(pi2) || ~isfinite(mu2), pi2 = pi1; mu2 = mu1".
+    let exp2_finite = pi2_safe.is_finite() && mu2_safe.is_finite();
+    let pi2 = if exp2_finite { pi2_safe } else { pi1 };
+    let mu2 = if exp2_finite { mu2_safe } else { mu1 };
 
-    let posterior_precision = (1.0 - weighting) * pi_l1 + weighting * pi_l2;
-    let posterior_mean = (1.0 - weighting) * mu_l1 + weighting * mu_l2;
+    // Variational energy-based softmax blend (direct form, matches MATLAB)
+    let ey1 = time_step * (ka * mu1 + om).exp();
+    let i1 = -0.5 * (al_aux + ey1).ln()
+        - 0.5 * be_aux / (al_aux + ey1)
+        - 0.5 * pihat_j * (mu1 - muhat_j).powi(2);
+
+    let ey2 = time_step * (ka * mu2 + om).exp();
+    let i2 = -0.5 * (al_aux + ey2).ln()
+        - 0.5 * be_aux / (al_aux + ey2)
+        - 0.5 * pihat_j * (mu2 - muhat_j).powi(2);
+
+    let b = 1.0 / (1.0 + (i1 - i2).exp()); // sigmoid(i2 - i1)
+
+    // Gaussian mixture moment matching
+    let posterior_mean = (1.0 - b) * mu1 + b * mu2;
+    let sig2 = (1.0 - b) / pi1 + b / pi2 + b * (1.0 - b) * (mu1 - mu2).powi(2);
+    let posterior_precision = 1.0 / sig2;
 
     (posterior_precision, posterior_mean)
 }

@@ -185,6 +185,8 @@ class Network:
         inputs_y_idxs: tuple[int, ...],
         overwrite: bool = True,
         lr: Union[str, float] = 0.2,
+        learning_kind: str = "precision_weighted",
+        params: Optional[dict] = None,
     ) -> "Network":
         """Create the belief propagation function.
 
@@ -202,7 +204,16 @@ class Network:
             preexisting values. Otherwise, do not create a new function if the attribute
             `scan_fn` is already defined.
         lr :
-            The kind of learning to use for the coupling strengths.
+            How the gradient is applied: a non-negative float for direct scaling, or
+            ``"adam"`` for the Adam optimiser.  Applied uniformly across all
+            *learning_kind* values, including ``"dynamic"``.
+        learning_kind :
+            Gradient computation mode: ``"standard"``, ``"precision_weighted"``
+            (default), or ``"dynamic"``.
+        params :
+            Dictionary of Adam hyper-parameters (used only when ``lr="adam"``):
+            ``beta1`` (default 0.9), ``beta2`` (default 0.999), ``epsilon``
+            (default 1e-8), and ``lr`` (default 1e-3, the Adam step size).
 
         """
         # get the dimension of the input nodes
@@ -216,12 +227,24 @@ class Network:
             )
         # create the learning sequence
         # all nodes except the prediction nodes should update their coupling strengths
-        if lr == "dynamic":
-            learn_fn = learning_weights
+        use_adam = lr == "adam"
+        if use_adam:
+            p = params or {}
+            adam_lr = p.get("lr", 1e-3)
+            learn_fn = Partial(
+                learning_weights,
+                kind=learning_kind,
+                lr=adam_lr,
+                adam_beta1=p.get("beta1", 0.9),
+                adam_beta2=p.get("beta2", 0.999),
+                adam_epsilon=p.get("epsilon", 1e-8),
+            )
         elif isinstance(lr, float):
-            learn_fn = Partial(learning_weights, lr=lr)
+            learn_fn = Partial(learning_weights, kind=learning_kind, lr=lr)
         else:
-            raise ValueError("Invalid lr value. Should be 'dynamic' or a float value.")
+            raise ValueError(
+                f"Invalid lr value '{lr}'. Expected a non-negative float or 'adam'."
+            )
 
         # do not update the last layer
         update_steps = [
@@ -232,9 +255,9 @@ class Network:
 
         # the learning steps should apply weight learning
         # in the same order than the prediction errors occure
-        # only continuous-state (node_type 2) and volatile-state (node_type 6) nodes
-        # are eligible; binary-state nodes use sigmoid(Σ parent_expected_mean) which
-        # does not involve coupling weights, so the linear learning rule would be wrong.
+        # continuous-state (2), volatile-state (6), and binary-state (1) nodes
+        # are eligible. binary-state uses sigmoid coupling in the weight update.
+        # Constant-state nodes (node_type 0) cannot have parents, so they are excluded.
         learning_steps = []  # list of weight update to perform at this layer
         for i, update in enumerate(update_steps):
             fn = update[1]
@@ -243,10 +266,17 @@ class Network:
             )
             if fn is not None and "prediction_error" in fn_name:
                 node_idx = update[0]
+                # Skip constant-state nodes (they cannot have parents)
+                if self.edges[node_idx].node_type == 0:
+                    continue
+                # Skip nodes without value parents (nothing to learn)
+                if self.edges[node_idx].value_parents is None:
+                    continue
                 if self.edges[node_idx].node_type in {
+                    1,
                     2,
                     6,
-                }:  # continuous-state, volatile-state
+                }:  # binary-state, continuous-state, volatile-state
                     learning_steps.append((node_idx, learn_fn))
 
         # do not predict on the last layer
@@ -262,6 +292,16 @@ class Network:
             learning_steps=tuple(learning_steps),
         )
 
+        # Initialize Adam state for nodes that learn weights
+        if use_adam:
+            for node_idx, _ in learning_steps:
+                n_weights = len(
+                    self.edges[node_idx].value_parents  # type: ignore[arg-type]
+                )
+                self.attributes[node_idx]["adam_m"] = jnp.zeros(n_weights)
+                self.attributes[node_idx]["adam_v"] = jnp.zeros(n_weights)
+            self.attributes[-1]["adam_t"] = jnp.array(0)
+
         # create the learning propagation function
         # this function is used by scan to loop over predictors (x) and predictions (y)
         if (self.scan_fn is None) or overwrite:
@@ -271,6 +311,7 @@ class Network:
                 edges=self.edges,
                 inputs_x_idxs=inputs_x_idxs,
                 inputs_y_idxs=inputs_y_idxs,
+                use_adam=use_adam,
             )
 
         return self
@@ -282,6 +323,9 @@ class Network:
         inputs_x_idxs: tuple[int, ...],
         inputs_y_idxs: tuple[int, ...],
         lr: Union[str, float] = 0.2,
+        learning_kind: str = "precision_weighted",
+        params: Optional[dict] = None,
+        record_trajectories: bool = False,
         overwrite: bool = True,
     ):
         """Add new observations.
@@ -301,7 +345,20 @@ class Network:
         inputs_y_idxs :
             The indexes of the nodes receiving the predictions (y).
         lr :
-            The kind of learning to use for the coupling strengths.
+            How the gradient is applied: a non-negative float for direct scaling, or
+            ``"adam"`` for the Adam optimiser.
+        learning_kind :
+            Gradient computation mode: ``"standard"``, ``"precision_weighted"``
+            (default), or ``"dynamic"``.
+        params :
+            Dictionary of Adam hyper-parameters (used only when ``lr="adam"``):
+            ``beta1`` (default 0.9), ``beta2`` (default 0.999), ``epsilon``
+            (default 1e-8), and ``lr`` (default 1e-3, the Adam step size).
+        record_trajectories :
+            If True, record the full node trajectories at every time step
+            (accessible via ``self.node_trajectories``). If False (default),
+            only the final state is kept, which significantly reduces memory
+            usage and speeds up training.
         overwrite :
             If `True`, create a new belief propagation function.
 
@@ -314,7 +371,11 @@ class Network:
         # generate the belief propagation function
         if (self.scan_fn is None) or overwrite:
             self = self.create_learning_propagation_fn(
-                inputs_x_idxs=inputs_x_idxs, inputs_y_idxs=inputs_y_idxs, lr=lr
+                inputs_x_idxs=inputs_x_idxs,
+                inputs_y_idxs=inputs_y_idxs,
+                lr=lr,
+                learning_kind=learning_kind,
+                params=params,
             )
 
         # wrap the inputs
@@ -323,10 +384,20 @@ class Network:
         # this is where the model loops over the whole input time series
         # at each time point, the node structure is traversed and beliefs are updated
         # using precision-weighted prediction errors
-        last_attributes, node_trajectories = scan(self.scan_fn, self.attributes, inputs)
+        if record_trajectories:
+            last_attributes, node_trajectories = scan(
+                self.scan_fn, self.attributes, inputs
+            )
+            self.node_trajectories = node_trajectories
+        else:
 
-        # belief trajectories
-        self.node_trajectories = node_trajectories
+            def _no_traj_step(attributes, inputs):
+                new_attributes, _ = self.scan_fn(attributes, inputs)
+                return new_attributes, None
+
+            last_attributes, _ = scan(_no_traj_step, self.attributes, inputs)
+            self.node_trajectories = None  # type: ignore[assignment]
+
         self.last_attributes = last_attributes
 
         return self
@@ -406,6 +477,7 @@ class Network:
         observed: Optional[tuple[ArrayLike, ...]] = None,
         input_idxs: Optional[tuple[int]] = None,
         rng_keys: Optional[random.PRNGKey] = None,
+        record_trajectories: bool = True,
     ):
         """Add new observations.
 
@@ -435,6 +507,11 @@ class Network:
         rng_keys :
             Optional. A random key for the random number generator. This is only used
             when an action function is provided.
+        record_trajectories :
+            If True (default), record the full node trajectories at every time
+            step (accessible via ``self.node_trajectories``).  If False, only
+            the final state is kept, which significantly reduces memory usage
+            and speeds up training.
 
         """
         if rng_keys is not None:
@@ -478,10 +555,20 @@ class Network:
         # this is where the model loops over the whole input time series
         # at each time point, the node structure is traversed and beliefs are updated
         # using precision-weighted prediction errors
-        last_attributes, node_trajectories = scan(self.scan_fn, self.attributes, inputs)
+        if record_trajectories:
+            last_attributes, node_trajectories = scan(
+                self.scan_fn, self.attributes, inputs
+            )
+            self.node_trajectories = node_trajectories
+        else:
 
-        # belief trajectories
-        self.node_trajectories = node_trajectories
+            def _no_traj_step(attributes, inputs):
+                new_attributes, _ = self.scan_fn(attributes, inputs)
+                return new_attributes, None
+
+            last_attributes, _ = scan(_no_traj_step, self.attributes, inputs)
+            self.node_trajectories = None  # type: ignore[assignment]
+
         self.last_attributes = last_attributes
 
         return self
