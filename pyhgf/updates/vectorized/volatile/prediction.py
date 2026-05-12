@@ -96,8 +96,10 @@ def vectorized_layer_prediction(
 
     # Mean prediction via matrix multiply
     # weights shape: (n_children, n_parents) or (n_children, n_parents + 1)
-    # parent_state.expected_mean shape: (n_parents,)
+    # parent_state.expected_mean shape: (n_parents,) or (C, H, W) for conv parent
     parent_mean = parent_state.expected_mean
+    if parent_mean.ndim > 1:
+        parent_mean = parent_mean.ravel()  # flatten conv parent to 1-D
     if parent_has_constant:
         # Append constant 1.0 for bias node before applying coupling_fn
         parent_mean = jnp.concatenate([parent_mean, jnp.ones(1)])
@@ -136,6 +138,8 @@ def vectorized_layer_prediction(
     # is the parent's predicted precision. The constant-bias parent (if any)
     # has infinite precision and therefore contributes zero.
     parent_precision = parent_state.expected_precision
+    if parent_precision.ndim > 1:
+        parent_precision = parent_precision.ravel()  # flatten conv parent precision
     if parent_has_constant:
         parent_precision = jnp.concatenate([parent_precision, jnp.array([jnp.inf])])
     g_prime = vmap(grad(coupling_fn))(parent_mean)

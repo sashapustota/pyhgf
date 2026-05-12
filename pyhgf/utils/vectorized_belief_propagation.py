@@ -15,6 +15,12 @@ from pyhgf.updates.vectorized.binary import (
     vectorized_binary_prediction,
     vectorized_binary_prediction_error,
 )
+from pyhgf.updates.vectorized.conv_learning import vectorized_conv_weight_update
+from pyhgf.updates.vectorized.conv_prediction import (
+    vectorized_conv_parent_posterior_from_conv,
+    vectorized_conv_parent_posterior_from_fc,
+    vectorized_conv_prediction,
+)
 from pyhgf.updates.vectorized.learning import vectorized_weight_update
 from pyhgf.updates.vectorized.volatile import (
     vectorized_layer_posterior_update,
@@ -37,6 +43,7 @@ def propagation_step(
     learning_kind: str = "precision_weighted",
     weight_update: bool = True,
     max_posterior_precision: float = 1e10,
+    conv_specs: Optional[list] = None,
 ) -> tuple[NetworkState, jnp.ndarray]:
     """Single propagation step through the network.
 
@@ -84,6 +91,9 @@ def propagation_step(
         Upper bound applied to every posterior precision write (value level via
         :func:`vectorized_layer_posterior_update` and volatility level via
         :func:`vectorized_layer_prediction_error`). Default ``1e10``.
+    conv_specs :
+        Per-layer conv spec dicts (``None`` for FC layers). Required when any
+        ``layer_kinds`` element is ``"conv"``.
 
     Returns
     -------
@@ -107,6 +117,10 @@ def propagation_step(
     if volatility_parents is None:
         volatility_parents = [True] * n_layers
 
+    # Default: no conv layers
+    if conv_specs is None:
+        conv_specs = [None] * n_layers
+
     # 1. Set predictors (top layer = input)
     layers[-1] = layers[-1]._replace(expected_mean=x, mean=x)
 
@@ -115,7 +129,23 @@ def propagation_step(
 
     # 3. Prediction: top-down (using current parent means)
     for i in range(n_layers - 1, 0, -1):
-        if layer_kinds[i - 1] == "binary":
+        if layer_kinds[i - 1] == "conv":
+            spec = conv_specs[i - 1]
+            layers[i - 1] = vectorized_conv_prediction(
+                child_state=layers[i - 1],
+                parent_state=layers[i],
+                kernel=weights[i - 1][0],
+                bias=weights[i - 1][1],
+                params=params[i - 1],
+                time_step=state.time_step,
+                coupling_fn=coupling_fns[i],
+                stride=spec["stride"],
+                padding=spec["padding"],
+                pool=spec["pool"],
+                pool_size=spec["pool_size"],
+                pool_stride=spec["pool_stride"],
+            )
+        elif layer_kinds[i - 1] == "binary":
             layers[i - 1] = vectorized_binary_prediction(
                 child_state=layers[i - 1],
                 parent_state=layers[i],
@@ -152,26 +182,61 @@ def propagation_step(
 
     # Step 4b: per hidden layer — posterior then PE (interleaved)
     for i in range(1, n_layers - 1):
-        layers[i] = vectorized_layer_posterior_update(
-            layer=layers[i],
-            child=layers[i - 1],
-            weights=weights[i - 1],
-            coupling_fn_grad=coupling_fn_grads[i],  # parent i's grad
-            parent_has_constant=add_constant_inputs[i],
-            max_posterior_precision=max_posterior_precision,
-        )
-        # Recompute PE and update volatility level so the layer
-        # above receives the correct (post-posterior) error signal.
-        if layer_kinds[i] == "binary":
-            layers[i] = vectorized_binary_prediction_error(layer=layers[i])
-        else:
+        if layer_kinds[i] == "conv":
+            # Gradient-based one-step posterior update for conv parent layers
+            w_child = weights[i - 1]
+            if isinstance(w_child, tuple):
+                # Child is also conv → use conv_transpose gradient
+                spec = conv_specs[i - 1]
+                layers[i] = vectorized_conv_parent_posterior_from_conv(
+                    parent_state=layers[i],
+                    child_state=layers[i - 1],
+                    kernel=w_child[0],
+                    bias=w_child[1],
+                    coupling_fn=coupling_fns[i],
+                    stride=spec["stride"],
+                    padding=spec["padding"],
+                    pool=spec["pool"],
+                    pool_size=spec["pool_size"],
+                    pool_stride=spec["pool_stride"],
+                )
+            else:
+                # Child is FC → use FC matrix transpose
+                layers[i] = vectorized_conv_parent_posterior_from_fc(
+                    parent_state=layers[i],
+                    child_state=layers[i - 1],
+                    fc_weights=w_child,
+                    coupling_fn=coupling_fns[i],
+                    add_constant_input=add_constant_inputs[i],
+                )
             layers[i] = vectorized_layer_prediction_error(
                 layer=layers[i],
                 params=params[i],
                 update_type=update_type,
-                has_volatility_parent=volatility_parents[i],
+                has_volatility_parent=False,  # conv always has no volatility parent
                 max_posterior_precision=max_posterior_precision,
             )
+        else:
+            layers[i] = vectorized_layer_posterior_update(
+                layer=layers[i],
+                child=layers[i - 1],
+                weights=weights[i - 1],
+                coupling_fn_grad=coupling_fn_grads[i],  # parent i's grad
+                parent_has_constant=add_constant_inputs[i],
+                max_posterior_precision=max_posterior_precision,
+            )
+            # Recompute PE and update volatility level so the layer
+            # above receives the correct (post-posterior) error signal.
+            if layer_kinds[i] == "binary":
+                layers[i] = vectorized_binary_prediction_error(layer=layers[i])
+            else:
+                layers[i] = vectorized_layer_prediction_error(
+                    layer=layers[i],
+                    params=params[i],
+                    update_type=update_type,
+                    has_volatility_parent=volatility_parents[i],
+                    max_posterior_precision=max_posterior_precision,
+                )
 
     # ========== LEARNING PHASE (after inference converges) ==========
     # Update weights once using converged activities — skipped when
@@ -191,23 +256,52 @@ def propagation_step(
             beta1, beta2, epsilon, _adam_lr = 0.9, 0.999, 1e-8, 1e-3
 
         for i in range(1, n_layers):
-            weights[i - 1], new_m, new_v = vectorized_weight_update(
-                parent_state=layers[i],
-                child_state=layers[i - 1],
-                weights=weights[i - 1],
-                coupling_fn=coupling_fns[i],
-                kind=learning_kind,
-                lr=lr,
-                parent_has_constant=add_constant_inputs[i],
-                child_is_binary=(layer_kinds[i - 1] == "binary"),
-                adam_m=adam_m_list[i - 1] if use_adam else None,
-                adam_v=adam_v_list[i - 1] if use_adam else None,
-                adam_t=adam_t,
-                adam_lr=_adam_lr,
-                adam_beta1=beta1,
-                adam_beta2=beta2,
-                adam_epsilon=epsilon,
-            )
+            w = weights[i - 1]
+            if isinstance(w, tuple):
+                # Conv weight update
+                spec = conv_specs[i - 1]
+                new_w, new_m, new_v = vectorized_conv_weight_update(
+                    child_state=layers[i - 1],
+                    parent_state=layers[i],
+                    kernel=w[0],
+                    bias=w[1],
+                    coupling_fn=coupling_fns[i],
+                    lr=lr,
+                    stride=spec["stride"],
+                    padding=spec["padding"],
+                    pool=spec["pool"],
+                    pool_size=spec["pool_size"],
+                    pool_stride=spec["pool_stride"],
+                    kind=learning_kind,
+                    adam_m=adam_m_list[i - 1] if use_adam else None,
+                    adam_v=adam_v_list[i - 1] if use_adam else None,
+                    adam_t=adam_t,
+                    adam_lr=_adam_lr,
+                    adam_beta1=beta1,
+                    adam_beta2=beta2,
+                    adam_epsilon=epsilon,
+                )
+                weights[i - 1] = new_w
+            else:
+                # FC weight update
+                new_w, new_m, new_v = vectorized_weight_update(
+                    parent_state=layers[i],
+                    child_state=layers[i - 1],
+                    weights=w,
+                    coupling_fn=coupling_fns[i],
+                    kind=learning_kind,
+                    lr=lr,
+                    parent_has_constant=add_constant_inputs[i],
+                    child_is_binary=(layer_kinds[i - 1] == "binary"),
+                    adam_m=adam_m_list[i - 1] if use_adam else None,
+                    adam_v=adam_v_list[i - 1] if use_adam else None,
+                    adam_t=adam_t,
+                    adam_lr=_adam_lr,
+                    adam_beta1=beta1,
+                    adam_beta2=beta2,
+                    adam_epsilon=epsilon,
+                )
+                weights[i - 1] = new_w
             if use_adam and new_m is not None:
                 adam_m_list[i - 1] = new_m
                 adam_v_list[i - 1] = new_v

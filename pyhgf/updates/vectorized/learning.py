@@ -146,11 +146,11 @@ def vectorized_weight_update(
     # Prediction error at child layer
     pe = child_state.mean - child_state.expected_mean
 
-    # Coupled parent activation. The coupling is applied to the parent's actual
-    # activations only; the constant bias node is always wired in linearly
-    # (g(1) = 1) regardless of coupling_fn, so the bias entry is appended to the
-    # coupled vector untouched.
-    coupled_parent = coupling_fn(parent_state.mean)
+    # Coupled parent activation. Flatten first if parent is a conv layer (ndim > 1).
+    parent_mean_flat = parent_state.mean
+    if parent_mean_flat.ndim > 1:
+        parent_mean_flat = parent_mean_flat.ravel()
+    coupled_parent = coupling_fn(parent_mean_flat)
     if parent_has_constant:
         coupled_parent = jnp.concatenate([coupled_parent, jnp.ones(1)])
 
@@ -159,12 +159,10 @@ def vectorized_weight_update(
 
     # Compute the gradient according to *kind*
     if kind in ("precision_ratio", "map_natural", "pure_natural"):
-        # All three rules need the parent's expected precision, optionally
-        # extended with a 1.0 entry for the constant bias node.
         parent_precision = parent_state.expected_precision
+        if parent_precision.ndim > 1:
+            parent_precision = parent_precision.ravel()  # flatten conv parent
         if parent_has_constant:
-            # Constant state nodes are assumed to have mean = 1.0 and
-            # precision = 1.0 (fully known bias).
             parent_precision = jnp.concatenate([parent_precision, jnp.ones(1)])
 
     if kind == "precision_ratio" and not child_is_binary:
