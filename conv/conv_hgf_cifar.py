@@ -46,12 +46,14 @@ def build_network(seed):
     net.add_layer(size=10, kind="binary",
                   tonic_volatility=TONIC_VOL,
                   tonic_volatility_vol=TONIC_VOL_VOL,
-                  add_constant_input=False)
+                  add_constant_input=False,
+                  volatility_parent=False)
     # FC head (flattens 512*2*2 = 2048 conv features)
     net.add_layer(size=512,
                   tonic_volatility=TONIC_VOL,
                   tonic_volatility_vol=TONIC_VOL_VOL,
-                  add_constant_input=True)
+                  add_constant_input=True,
+                  volatility_parent=False)
     # Conv blocks (added output → input)
     for out_ch in [512, 256, 128, 64]:
         net.add_conv_layer(out_channels=out_ch,
