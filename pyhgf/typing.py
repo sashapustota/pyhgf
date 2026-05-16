@@ -21,7 +21,6 @@ class AdjacencyLists(NamedTuple):
 
     The variable `coupling_fn` list the coupling functions between this nodes and the
     children nodes. If `None` is provided, a linear coupling is assumed.
-
     """
 
     node_type: int
@@ -65,10 +64,11 @@ NetworkParameters = tuple[Attributes, Edges, UpdateSequence]
 
 
 class LayerState(NamedTuple):
-    """State for all nodes in a layer. All arrays have shape (n_nodes,).
+    """State for all nodes in a layer.
 
-    This represents the state of a volatile node layer with both value level (external)
-    and volatility level (internal) variables.
+    All arrays have shape (n_nodes,).     This represents the state of a volatile node
+    layer with both value level (external)     and volatility level (internal)
+    variables.
     """
 
     # Value level (external)
@@ -88,13 +88,14 @@ class LayerState(NamedTuple):
     volatility_prediction_error: Array
 
     @classmethod
-    def create(cls, n_nodes: int) -> "LayerState":
+    def create(cls, shape) -> "LayerState":
         """Create a LayerState with default initialization.
 
         Parameters
         ----------
-        n_nodes :
-            Number of nodes in the layer.
+        shape :
+            Number of nodes (int) or spatial shape tuple, e.g. ``(out_ch, H, W)``
+            for convolutional layers.
 
         Returns
         -------
@@ -102,64 +103,78 @@ class LayerState(NamedTuple):
             Initialized layer state with zeros for means/errors
             and ones for precisions.
         """
+        if isinstance(shape, int):
+            shape = (shape,)
         return cls(
             # Value level
-            mean=jnp.zeros(n_nodes),
-            precision=jnp.ones(n_nodes),
-            expected_mean=jnp.zeros(n_nodes),
-            expected_precision=jnp.ones(n_nodes),
-            effective_precision=jnp.zeros(n_nodes),
-            value_prediction_error=jnp.zeros(n_nodes),
+            mean=jnp.zeros(shape),
+            precision=jnp.ones(shape),
+            expected_mean=jnp.zeros(shape),
+            expected_precision=jnp.ones(shape),
+            effective_precision=jnp.zeros(shape),
+            value_prediction_error=jnp.zeros(shape),
             # Volatility level
-            mean_vol=jnp.zeros(n_nodes),
-            precision_vol=jnp.ones(n_nodes),
-            expected_mean_vol=jnp.zeros(n_nodes),
-            expected_precision_vol=jnp.ones(n_nodes),
-            effective_precision_vol=jnp.zeros(n_nodes),
-            volatility_prediction_error=jnp.zeros(n_nodes),
+            mean_vol=jnp.zeros(shape),
+            precision_vol=jnp.ones(shape),
+            expected_mean_vol=jnp.zeros(shape),
+            expected_precision_vol=jnp.ones(shape),
+            effective_precision_vol=jnp.zeros(shape),
+            volatility_prediction_error=jnp.zeros(shape),
         )
 
 
 class LayerParams(NamedTuple):
-    """Static parameters for a layer. All arrays have shape (n_nodes,).
+    """Static parameters for a layer. All arrays have shape (n_nodes,) or (out_ch, H, W).
 
-    These parameters control the volatility dynamics of the layer.
+    All arrays have shape (n_nodes,).     These parameters control the volatility
+    dynamics of the layer.
     """
 
     tonic_volatility: Array  # Value level tonic volatility
     tonic_volatility_vol: Array  # Volatility level tonic volatility
     volatility_coupling: Array  # Internal volatility coupling strength
+    autoconnection_strength_vol: Array  # Implied volatility parent autoconnection
 
     @classmethod
     def create(
         cls,
-        n_nodes: int,
+        shape,
         tonic_volatility: float = -4.0,
         tonic_volatility_vol: float = -4.0,
         volatility_coupling: float = 1.0,
+        autoconnection_strength_vol: float = 1.0,
     ) -> "LayerParams":
         """Create LayerParams with specified values.
 
         Parameters
         ----------
-        n_nodes :
-            Number of nodes in the layer.
+        shape :
+            Number of nodes (int) or spatial shape tuple, e.g. ``(out_ch, H, W)``
+            for convolutional layers.
         tonic_volatility :
             Value level tonic volatility (log scale).
         tonic_volatility_vol :
             Volatility level tonic volatility (log scale).
         volatility_coupling :
             Internal volatility coupling strength.
+        autoconnection_strength_vol :
+            Autoconnection strength of the implied volatility parent. The
+            volatility-level expected mean is computed as
+            ``autoconnection_strength_vol * mean_vol``. Defaults to ``1.0``
+            (random walk on the volatility level).
 
         Returns
         -------
         LayerParams
             Initialized layer parameters.
         """
+        if isinstance(shape, int):
+            shape = (shape,)
         return cls(
-            tonic_volatility=jnp.full(n_nodes, tonic_volatility),
-            tonic_volatility_vol=jnp.full(n_nodes, tonic_volatility_vol),
-            volatility_coupling=jnp.full(n_nodes, volatility_coupling),
+            tonic_volatility=jnp.full(shape, tonic_volatility),
+            tonic_volatility_vol=jnp.full(shape, tonic_volatility_vol),
+            volatility_coupling=jnp.full(shape, volatility_coupling),
+            autoconnection_strength_vol=jnp.full(shape, autoconnection_strength_vol),
         )
 
 

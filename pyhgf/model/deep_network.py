@@ -3,12 +3,13 @@
 
 """Vectorized deep predictive coding network.
 
-This module provides a vectorized implementation of deep HGF networks that uses
-layer-wise matrix operations instead of per-node updates.
+This module provides a vectorized implementation of deep HGF networks that uses layer-
+wise matrix operations instead of per-node updates.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional, Union
 
 import jax
@@ -28,11 +29,93 @@ from pyhgf.utils.weight_initialisation import (
     xavier_init,
 )
 
+
+def _conv_output_shape(parent_shape: tuple, conv_spec: dict) -> tuple:
+    """Compute the output spatial shape of a conv layer.
+
+    Parameters
+    ----------
+    parent_shape :
+        Shape of the parent (input) layer, ``(in_ch, H, W)``.
+    conv_spec :
+        Dict with keys ``out_channels``, ``kernel_size``, ``stride``,
+        ``padding``, ``pool``, ``pool_size``, ``pool_stride``.
+
+    Returns
+    -------
+    tuple
+        Output shape ``(out_ch, H_out, W_out)``.
+    """
+    _, H, W = parent_shape[0], parent_shape[1], parent_shape[2]
+    out_ch = conv_spec["out_channels"]
+    k = conv_spec["kernel_size"]
+    s = conv_spec["stride"]
+    padding = conv_spec["padding"]
+    pool = conv_spec["pool"]
+    pool_size = conv_spec["pool_size"]
+    pool_stride = conv_spec["pool_stride"]
+
+    if padding == "SAME":
+        H_out = math.ceil(H / s)
+        W_out = math.ceil(W / s)
+    else:  # "VALID"
+        H_out = (H - k) // s + 1
+        W_out = (W - k) // s + 1
+
+    if pool:
+        H_out = (H_out - pool_size) // pool_stride + 1
+        W_out = (W_out - pool_size) // pool_stride + 1
+
+    return (out_ch, H_out, W_out)
+
+
+def _compute_layer_shapes(
+    layer_sizes: list,
+    conv_specs: list,
+    input_shape: Optional[tuple],
+) -> list:
+    """Compute the actual array shape for every layer.
+
+    Parameters
+    ----------
+    layer_sizes :
+        Per-layer node count (int) — used for FC layers; ignored for conv.
+    conv_specs :
+        Per-layer conv spec dict or ``None`` for FC layers.
+    input_shape :
+        Spatial shape of the raw input ``(C, H, W)``. Required when any conv
+        layer is present.
+
+    Returns
+    -------
+    list[tuple]
+        Per-layer shape, e.g. ``(n,)`` for FC or ``(C, H, W)`` for conv.
+    """
+    n = len(layer_sizes)
+    shapes: list = [None] * n
+
+    for i in range(n - 1, -1, -1):
+        if i == n - 1:
+            # Last layer = raw input
+            if input_shape is not None:
+                shapes[i] = input_shape
+            else:
+                shapes[i] = (layer_sizes[i],)
+        elif conv_specs[i] is not None:
+            # Conv hidden layer: compute from parent's shape
+            parent_shape = shapes[i + 1]
+            shapes[i] = _conv_output_shape(parent_shape, conv_specs[i])
+        else:
+            shapes[i] = (layer_sizes[i],)
+
+    return shapes
+
 # Default per-layer parameter values (matching ``LayerParams.create``).
 _LAYER_PARAM_DEFAULTS: dict[str, float] = {
     "tonic_volatility": -4.0,
     "tonic_volatility_vol": -4.0,
     "volatility_coupling": 1.0,
+    "autoconnection_strength_vol": 1.0,
 }
 
 # Names of fields that can be overridden per layer.
@@ -83,6 +166,7 @@ class DeepNetwork:
         self,
         coupling_fn: Callable = lambda x: x,
         update_type: str = "eHGF",
+        max_posterior_precision: float = 1e10,
     ):
         """Initialize a VectorizedDeepNetwork.
 
@@ -96,9 +180,15 @@ class DeepNetwork:
             The type of volatility-level posterior update. Can be ``"eHGF"``
             (default), ``"standard"`` or ``"unbounded"``. Matches the Network
             class and Rust backend.
+        max_posterior_precision :
+            Upper bound applied to every posterior precision write (value level and
+            volatility level). Defaults to ``1e10`` and is shared with the nodalised
+            ``Network`` and the Rust backend. Increase it to relax the cap, or lower it
+            to be more conservative against precision blow-up.
         """
         self.coupling_fn = coupling_fn
         self.update_type = update_type
+        self.max_posterior_precision = float(max_posterior_precision)
         self.layer_sizes: list[int] = []
         self.layer_kinds: list[str] = []
         # Per-layer overrides for fields of ``LayerState`` and ``LayerParams``.
@@ -108,6 +198,9 @@ class DeepNetwork:
         self.fully_connected: list[bool] = []
         self.coupling_fns: list[Callable] = []  # per-layer coupling functions
         self.volatility_parents: list[bool] = []
+        # Conv support
+        self.conv_specs: list[Optional[dict]] = []  # None for FC, dict for conv
+        self.input_shape: Optional[tuple] = None   # set by add_spatial_input
         self.state: Optional[NetworkState] = None
         self.trajectories: Optional[NetworkState] = None
         self.predictions: Optional[jnp.ndarray] = None
@@ -115,6 +208,8 @@ class DeepNetwork:
         self._propagation_lr: Optional[Union[float, str]] = None
         self._propagation_learning_kind: Optional[str] = None
         self._record_trajectories: bool = False
+        self._propagation_weight_update: bool = True
+        self._propagation_max_posterior_precision: Optional[float] = None
         self._prediction_fn: Optional[Callable] = None
 
     def add_layer(
@@ -155,7 +250,8 @@ class DeepNetwork:
             Per-layer overrides for any field of :class:`pyhgf.typing.LayerState`
             (e.g. ``mean``, ``precision``, ``expected_mean``, ``expected_precision``,
             ``mean_vol``, ``precision_vol``, ...) or :class:`pyhgf.typing.LayerParams`
-            (``tonic_volatility``, ``tonic_volatility_vol``, ``volatility_coupling``).
+            (``tonic_volatility``, ``tonic_volatility_vol``, ``volatility_coupling``,
+            ``autoconnection_strength_vol``).
             Each value is broadcast to the layer's ``size``. Unknown names raise
             ``ValueError``. Defaults match ``LayerState.create`` and
             ``LayerParams.create``.
@@ -207,6 +303,7 @@ class DeepNetwork:
 
         self.layer_sizes.append(size)
         self.layer_kinds.append(kind)
+        self.conv_specs.append(None)
         self.layer_overrides.append(dict(kwargs))
         self.add_constant_inputs.append(add_constant_input)
         self.fully_connected.append(fully_connected)
@@ -262,6 +359,112 @@ class DeepNetwork:
             )
         return self
 
+    def add_conv_layer(
+        self,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: str = "SAME",
+        pool: bool = False,
+        pool_size: int = 2,
+        pool_stride: int = 2,
+        coupling_fn: Optional[Callable] = None,
+        **kwargs,
+    ) -> "DeepNetwork":
+        """Add a convolutional layer.
+
+        Always uses ``volatility_parent=False`` (only tonic volatility drives
+        precision).  Layers are added output → input, same convention as
+        :meth:`add_layer`.
+
+        Parameters
+        ----------
+        out_channels :
+            Number of output feature maps.
+        kernel_size :
+            Square kernel side length.
+        stride :
+            Conv stride.
+        padding :
+            ``"SAME"`` (default) or ``"VALID"``.
+        pool :
+            Apply 2-D max-pool after conv.
+        pool_size :
+            Max-pool window size.
+        pool_stride :
+            Max-pool stride.
+        coupling_fn :
+            Per-layer activation function.  Falls back to the network-level
+            default when ``None``.
+        **kwargs :
+            Per-layer overrides for :class:`~pyhgf.typing.LayerState` or
+            :class:`~pyhgf.typing.LayerParams` fields.
+
+        Returns
+        -------
+        DeepNetwork
+            Self for method chaining.
+        """
+        invalid_keys = [k for k in kwargs if k not in _LAYER_OVERRIDE_FIELDS]
+        if invalid_keys:
+            raise ValueError(
+                f"Unknown layer override(s): {invalid_keys}. "
+                f"Valid fields are {sorted(_LAYER_OVERRIDE_FIELDS)}."
+            )
+
+        conv_spec = {
+            "out_channels": out_channels,
+            "kernel_size": kernel_size,
+            "stride": stride,
+            "padding": padding,
+            "pool": pool,
+            "pool_size": pool_size,
+            "pool_stride": pool_stride,
+        }
+
+        self.layer_sizes.append(out_channels)  # channel count (placeholder)
+        self.layer_kinds.append("conv")
+        self.conv_specs.append(conv_spec)
+        self.layer_overrides.append(dict(kwargs))
+        self.add_constant_inputs.append(False)
+        self.fully_connected.append(True)
+        self.coupling_fns.append(
+            coupling_fn if coupling_fn is not None else self.coupling_fn
+        )
+        self.volatility_parents.append(False)
+        return self
+
+    def add_spatial_input(self, C: int, H: int, W: int) -> "DeepNetwork":
+        """Add a spatial input layer that holds raw image data.
+
+        Sets :attr:`input_shape` to ``(C, H, W)`` and appends a volatile
+        layer (no conv kernel — it IS the raw input).
+
+        Parameters
+        ----------
+        C :
+            Number of input channels (e.g. 3 for RGB).
+        H :
+            Spatial height (e.g. 32 for CIFAR-10).
+        W :
+            Spatial width.
+
+        Returns
+        -------
+        DeepNetwork
+            Self for method chaining.
+        """
+        self.input_shape = (C, H, W)
+        self.layer_sizes.append(C * H * W)  # placeholder
+        self.layer_kinds.append("volatile")
+        self.conv_specs.append(None)
+        self.layer_overrides.append({})
+        self.add_constant_inputs.append(False)
+        self.fully_connected.append(True)
+        self.coupling_fns.append(self.coupling_fn)
+        self.volatility_parents.append(False)
+        return self
+
     def _init_state(self) -> NetworkState:
         """Initialize network state with uniform weights.
 
@@ -278,13 +481,19 @@ class DeepNetwork:
         weights = []
         params = []
 
-        for i, size in enumerate(self.layer_sizes):
+        # Compute actual per-layer shapes (1-D for FC, 3-D for conv/spatial input)
+        layer_shapes = _compute_layer_shapes(
+            self.layer_sizes, self.conv_specs, self.input_shape
+        )
+
+        for i in range(len(self.layer_sizes)):
+            shape = layer_shapes[i]
             overrides = self.layer_overrides[i]
 
-            # Layer state with per-layer overrides (broadcast scalar -> (n_nodes,))
-            state = LayerState.create(size)
+            # Layer state with per-layer overrides (broadcast scalar → shape)
+            state = LayerState.create(shape)
             state_overrides = {
-                k: jnp.full(size, v)
+                k: jnp.full(shape, v)
                 for k, v in overrides.items()
                 if k in _LAYER_STATE_FIELDS
             }
@@ -297,23 +506,49 @@ class DeepNetwork:
             for k, v in overrides.items():
                 if k in _LAYER_PARAM_FIELDS:
                     param_kwargs[k] = v
-            params.append(LayerParams.create(n_nodes=size, **param_kwargs))
+            params.append(LayerParams.create(shape=shape, **param_kwargs))
 
-            # Create weights connecting to next layer (if not first layer)
-            # weights[i-1] connects layer[i-1] (child) to layer[i] (parent)
-            # If the parent layer has add_constant_input=True, an extra column
-            # is appended for the bias node (constant mean = 1.0).
+            # Create weights connecting layer[i-1] (child) to layer[i] (parent)
             if i > 0:
-                prev_size = self.layer_sizes[i - 1]
-                n_parent_cols = size + (1 if self.add_constant_inputs[i] else 0)
-                if self.fully_connected[i]:
-                    weights.append(jnp.ones((prev_size, n_parent_cols)))
-                else:
-                    weights.append(jnp.eye(prev_size, n_parent_cols))
+                child_shape = layer_shapes[i - 1]
+                parent_shape = shape  # = layer_shapes[i]
 
-        # Adam moment buffers (zeros, same shapes as weights)
-        adam_m = tuple(jnp.zeros_like(w) for w in weights)
-        adam_v = tuple(jnp.zeros_like(w) for w in weights)
+                if self.conv_specs[i - 1] is not None:
+                    # Child is a conv layer → weight is a (kernel, bias) tuple
+                    spec = self.conv_specs[i - 1]
+                    in_ch = parent_shape[0]
+                    out_ch = child_shape[0]
+                    k = spec["kernel_size"]
+                    kernel = jnp.ones((out_ch, in_ch, k, k))
+                    bias = jnp.zeros(out_ch)
+                    weights.append((kernel, bias))
+                else:
+                    # Child is FC → 2-D weight matrix
+                    child_size = child_shape[0]
+                    parent_flat = 1
+                    for d in parent_shape:
+                        parent_flat *= d
+                    n_parent_cols = parent_flat + (
+                        1 if self.add_constant_inputs[i] else 0
+                    )
+                    if self.fully_connected[i]:
+                        weights.append(jnp.ones((child_size, n_parent_cols)))
+                    else:
+                        weights.append(jnp.eye(child_size, n_parent_cols))
+
+        # Adam moment buffers (zeros, matching weight structures)
+        adam_m = tuple(
+            (jnp.zeros_like(w[0]), jnp.zeros_like(w[1]))
+            if isinstance(w, tuple)
+            else jnp.zeros_like(w)
+            for w in weights
+        )
+        adam_v = tuple(
+            (jnp.zeros_like(w[0]), jnp.zeros_like(w[1]))
+            if isinstance(w, tuple)
+            else jnp.zeros_like(w)
+            for w in weights
+        )
 
         return NetworkState(
             layers=tuple(layers),
@@ -378,9 +613,30 @@ class DeepNetwork:
 
         new_weights = list(self.state.weights)
         for i, w in enumerate(new_weights):
-            n_children, n_parents = w.shape  # (prev_size, size)
-            flat = init_fn(n_parents, n_children, seed=seed, **kwargs)
-            new_weights[i] = jnp.array(flat.reshape(w.shape))
+            if isinstance(w, tuple):
+                # Conv weight: (kernel (out_ch, in_ch, kH, kW), bias (out_ch,))
+                kernel, bias = w
+                out_ch, in_ch, kH, kW = kernel.shape
+                fan_in = in_ch * kH * kW
+                rng_k = np.random.default_rng(
+                    seed + i if seed is not None else None
+                )
+                if strategy in ("he", "orthogonal", "sparse"):
+                    std = np.sqrt(2.0 / fan_in)
+                    new_k = rng_k.normal(0.0, std, size=kernel.shape).astype(
+                        np.float32
+                    )
+                else:  # xavier
+                    limit = np.sqrt(6.0 / (fan_in + out_ch))
+                    new_k = rng_k.uniform(
+                        -limit, limit, size=kernel.shape
+                    ).astype(np.float32)
+                new_b = np.zeros(bias.shape, dtype=np.float32)
+                new_weights[i] = (jnp.array(new_k), jnp.array(new_b))
+            else:
+                n_children, n_parents = w.shape  # (prev_size, size)
+                flat = init_fn(n_parents, n_children, seed=seed, **kwargs)
+                new_weights[i] = jnp.array(flat.reshape(w.shape))
 
         self.state = NetworkState(
             layers=self.state.layers,
@@ -399,6 +655,7 @@ class DeepNetwork:
         learning_kind: str = "precision_weighted",
         params: Optional[dict] = None,
         record_trajectories: bool = False,
+        weight_update: bool = True,
     ):
         """Create the jitted propagation function.
 
@@ -417,6 +674,10 @@ class DeepNetwork:
             If True, the scan output includes the full ``NetworkState`` at every time
             step (useful for inspection but significantly slower). If False (default),
             only predictions are accumulated.
+        weight_update :
+            If ``True`` (default), the learning phase updates the weights at the
+            end of each step. If ``False``, weights are frozen — the network
+            performs inference only.
 
         Returns
         -------
@@ -432,6 +693,8 @@ class DeepNetwork:
         layer_kinds = self.layer_kinds
         update_type = self.update_type
         volatility_parents = self.volatility_parents
+        max_posterior_precision = self.max_posterior_precision
+        conv_specs = self.conv_specs  # per-layer conv spec (None for FC layers)
 
         # Resolve Adam hyper-parameters when lr="adam".
         if lr == "adam":
@@ -460,6 +723,9 @@ class DeepNetwork:
                     update_type,
                     volatility_parents,
                     learning_kind,
+                    weight_update,
+                    max_posterior_precision,
+                    conv_specs,
                 )
                 return new_state, (new_state, output_pred)
 
@@ -478,6 +744,9 @@ class DeepNetwork:
                     update_type,
                     volatility_parents,
                     learning_kind,
+                    weight_update,
+                    max_posterior_precision,
+                    conv_specs,
                 )
 
         return jax.jit(_step)
@@ -490,10 +759,13 @@ class DeepNetwork:
         Callable
             JIT-compiled prediction function.
         """
+        from pyhgf.updates.vectorized.conv_prediction import vectorized_conv_prediction
+
         coupling_fns = self.coupling_fns
         add_constant_inputs = self.add_constant_inputs
         layer_kinds = self.layer_kinds
         volatility_parents = self.volatility_parents
+        conv_specs = self.conv_specs
 
         def prediction_step(state: NetworkState, x):
             """Forward prediction without learning."""
@@ -507,7 +779,23 @@ class DeepNetwork:
 
             # Top-down prediction
             for i in range(n_layers - 1, 0, -1):
-                if layer_kinds[i - 1] == "binary":
+                if layer_kinds[i - 1] == "conv":
+                    spec = conv_specs[i - 1]
+                    layers[i - 1] = vectorized_conv_prediction(
+                        child_state=layers[i - 1],
+                        parent_state=layers[i],
+                        kernel=state.weights[i - 1][0],
+                        bias=state.weights[i - 1][1],
+                        params=params[i - 1],
+                        time_step=state.time_step,
+                        coupling_fn=coupling_fns[i],
+                        stride=spec["stride"],
+                        padding=spec["padding"],
+                        pool=spec["pool"],
+                        pool_size=spec["pool_size"],
+                        pool_stride=spec["pool_stride"],
+                    )
+                elif layer_kinds[i - 1] == "binary":
                     layers[i - 1] = vectorized_binary_prediction(
                         child_state=layers[i - 1],
                         parent_state=layers[i],
@@ -540,6 +828,7 @@ class DeepNetwork:
         learning_kind: str = "precision_weighted",
         params: Optional[dict] = None,
         record_trajectories: bool = False,
+        weight_update: bool = True,
     ) -> "DeepNetwork":
         """Fit network to data.
 
@@ -571,6 +860,12 @@ class DeepNetwork:
             If True, record the full ``NetworkState`` at every time step (accessible
             via ``self.trajectories``).  This is useful for inspection but significantly
             increases memory usage and slows training. Default is False.
+        weight_update :
+            If ``True`` (default), the learning phase updates the network's
+            weights at the end of each step. Set to ``False`` to freeze the
+            weights and run only the inference (prediction → PE → posterior)
+            cycle — useful for evaluating a fixed model on new data while
+            still recording trajectories.
 
         Returns
         -------
@@ -592,14 +887,18 @@ class DeepNetwork:
             or self._propagation_lr != lr
             or self._propagation_learning_kind != learning_kind
             or self._record_trajectories != record_trajectories
+            or self._propagation_weight_update != weight_update
+            or self._propagation_max_posterior_precision != self.max_posterior_precision
         )
         if needs_retrace:
             self._propagation_fn = self._create_propagation_fn(
-                lr, learning_kind, params, record_trajectories
+                lr, learning_kind, params, record_trajectories, weight_update
             )
             self._propagation_lr = lr
             self._propagation_learning_kind = learning_kind
             self._record_trajectories = record_trajectories
+            self._propagation_weight_update = weight_update
+            self._propagation_max_posterior_precision = self.max_posterior_precision
 
         # Convert to JAX arrays
         x = jnp.asarray(x)
@@ -664,6 +963,7 @@ class DeepNetwork:
         self._propagation_lr = None
         self._propagation_learning_kind = None
         self._record_trajectories = False
+        self._propagation_weight_update = True
         self._prediction_fn = None
         return self
 
