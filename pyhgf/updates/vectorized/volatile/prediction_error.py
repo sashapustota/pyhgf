@@ -5,8 +5,8 @@
 
 This module mirrors :mod:`pyhgf.updates.prediction_error.volatile` for vectorized
 layers: it provides separate value and volatility prediction-error functions, per-
-update-type volatility posterior functions, and a combined driver that calls them in the
-correct order.
+update-type volatility posterior functions, and a combined driver that calls them in
+the correct order.
 """
 
 import jax.numpy as jnp
@@ -87,7 +87,6 @@ def vectorized_layer_volatility_prediction_error(
 def vectorized_layer_volatility_posterior_standard(
     layer: LayerState,
     params: LayerParams,
-    max_posterior_precision: float = 1e10,
 ) -> LayerState:
     """Update the volatility level using the standard ordering.
 
@@ -101,9 +100,6 @@ def vectorized_layer_volatility_posterior_standard(
         Current layer state with ``volatility_prediction_error`` set.
     params :
         Layer parameters (provides ``volatility_coupling``).
-    max_posterior_precision :
-        Upper bound applied to the volatility-level posterior precision.
-        Default ``1e10``.
 
     Returns
     -------
@@ -125,8 +121,7 @@ def vectorized_layer_volatility_posterior_standard(
         - 0.5 * (vol_coupling**2) * eff_prec * volatility_pe
     )
     posterior_precision_vol = jnp.clip(
-        layer.expected_precision_vol + precision_vol_contrib,
-        a_max=max_posterior_precision,
+        layer.expected_precision_vol + precision_vol_contrib, a_max=1e8
     )
 
     # Mean using updated precision
@@ -144,7 +139,6 @@ def vectorized_layer_volatility_posterior_standard(
 def vectorized_layer_volatility_posterior_ehgf(
     layer: LayerState,
     params: LayerParams,
-    max_posterior_precision: float = 1e10,
 ) -> LayerState:
     """EHGF volatility-level posterior update (mean first, then precision).
 
@@ -161,9 +155,6 @@ def vectorized_layer_volatility_posterior_ehgf(
         Current layer state with ``volatility_prediction_error`` set.
     params :
         Layer parameters (provides ``volatility_coupling``).
-    max_posterior_precision :
-        Upper bound applied to the volatility-level posterior precision.
-        Default ``1e10``.
 
     Returns
     -------
@@ -187,8 +178,7 @@ def vectorized_layer_volatility_posterior_ehgf(
         - 0.5 * (vol_coupling**2) * eff_prec * volatility_pe
     )
     posterior_precision_vol = jnp.clip(
-        layer.expected_precision_vol + precision_vol_contrib,
-        a_max=max_posterior_precision,
+        layer.expected_precision_vol + precision_vol_contrib, a_max=1e8
     )
 
     return layer._replace(
@@ -201,7 +191,6 @@ def vectorized_layer_volatility_posterior_unbounded(
     layer: LayerState,
     params: LayerParams,
     time_step: float,
-    max_posterior_precision: float = 1e10,
 ) -> LayerState:
     """Unbounded volatility-level posterior update (Lambert W₀ dual-quadratic).
 
@@ -221,9 +210,6 @@ def vectorized_layer_volatility_posterior_unbounded(
         ``tonic_volatility``).
     time_step :
         Current time step (needed to reconstruct the pre-prediction variance).
-    max_posterior_precision :
-        Upper bound applied to the volatility-level posterior precision.
-        Default ``1e10``.
 
     Returns
     -------
@@ -316,7 +302,7 @@ def vectorized_layer_volatility_posterior_unbounded(
     # ------------------------------------------------------------------
     posterior_mean_vol = (1.0 - b) * mu1 + b * mu2
     sig2 = (1.0 - b) / pi1 + b / pi2 + b * (1.0 - b) * (mu1 - mu2) ** 2
-    posterior_precision_vol = jnp.minimum(1.0 / sig2, max_posterior_precision)
+    posterior_precision_vol = 1.0 / sig2
 
     return layer._replace(
         precision_vol=posterior_precision_vol,
@@ -335,7 +321,6 @@ def vectorized_layer_prediction_error(
     update_type: str = "eHGF",
     time_step: float = 1.0,
     has_volatility_parent: bool = True,
-    max_posterior_precision: float = 1e10,
 ) -> LayerState:
     """Compute prediction errors and apply the volatility-level posterior update.
 
@@ -362,9 +347,6 @@ def vectorized_layer_prediction_error(
         the volatility-level posterior update (mean_vol, precision_vol).
         If False, only the value prediction error is computed and the
         volatility level is left unchanged.
-    max_posterior_precision :
-        Upper bound applied to the volatility-level posterior precision.
-        Default ``1e10``.
 
     Returns
     -------
@@ -381,19 +363,12 @@ def vectorized_layer_prediction_error(
     layer = vectorized_layer_volatility_prediction_error(layer)
 
     if update_type == "eHGF":
-        layer = vectorized_layer_volatility_posterior_ehgf(
-            layer, params, max_posterior_precision=max_posterior_precision
-        )
+        layer = vectorized_layer_volatility_posterior_ehgf(layer, params)
     elif update_type == "standard":
-        layer = vectorized_layer_volatility_posterior_standard(
-            layer, params, max_posterior_precision=max_posterior_precision
-        )
+        layer = vectorized_layer_volatility_posterior_standard(layer, params)
     elif update_type == "unbounded":
         layer = vectorized_layer_volatility_posterior_unbounded(
-            layer,
-            params,
-            time_step,
-            max_posterior_precision=max_posterior_precision,
+            layer, params, time_step
         )
 
     return layer
