@@ -128,6 +128,9 @@ def vectorized_weight_update(
     # Coupled parent activation
     parent_mean = parent_state.mean
     parent_precision = parent_state.precision
+    if parent_mean.ndim > 1:
+        parent_mean = parent_mean.ravel()
+        parent_precision = parent_precision.ravel()
     if parent_has_constant:
         parent_mean = jnp.concatenate([parent_mean, jnp.ones(1)])
         parent_precision = jnp.concatenate([

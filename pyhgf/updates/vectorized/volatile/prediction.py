@@ -89,6 +89,8 @@ def vectorized_layer_prediction(
     # weights shape: (n_children, n_parents) or (n_children, n_parents + 1)
     # parent_state.expected_mean shape: (n_parents,)
     parent_mean = parent_state.expected_mean
+    if parent_mean.ndim > 1:
+        parent_mean = parent_mean.ravel()  # flatten conv parent to 1-D
     if parent_has_constant:
         # Append constant 1.0 for bias node before applying coupling_fn
         parent_mean = jnp.concatenate([parent_mean, jnp.ones(1)])

@@ -163,9 +163,6 @@ def propagation_step(
                 coupling_fn=coupling_fns[i],
                 parent_has_constant=add_constant_inputs[i],
                 has_volatility_parent=volatility_parents[i - 1],
-                # Layer 0 is the observation layer of a DeepNetwork — it has no
-                # value children below, so it does not undergo a random walk.
-                is_input_layer=(i - 1 == 0),
             )
 
     # Step 4a: PE for output layer (mean = y, observation-pinned)
@@ -177,7 +174,6 @@ def propagation_step(
             params=params[0],
             update_type=update_type,
             has_volatility_parent=volatility_parents[0],
-            max_posterior_precision=max_posterior_precision,
         )
 
     # Step 4b: per hidden layer — posterior then PE (interleaved)
@@ -214,21 +210,14 @@ def propagation_step(
                 params=params[i],
                 update_type=update_type,
                 has_volatility_parent=False,  # conv always has no volatility parent
-                max_posterior_precision=max_posterior_precision,
             )
         else:
             layers[i] = vectorized_layer_posterior_update(
                 layer=layers[i],
                 child=layers[i - 1],
                 weights=weights[i - 1],
-                coupling_fn_grad=coupling_fn_grads[i],  # parent i's grad
+                coupling_fn_grad=coupling_fn_grads[i],
                 parent_has_constant=add_constant_inputs[i],
-                max_posterior_precision=max_posterior_precision,
-                # Layer 0 is the observation leaf — its `precision` is the
-                # representational stand-in for a clamped observation, not a
-                # bottom-up posterior gain. Tell the kernel to use the canonical
-                # contribution (paper's Limit 3, π_a → ∞) for that case.
-                child_is_input_layer=(i - 1 == 0),
             )
             # Recompute PE and update volatility level so the layer
             # above receives the correct (post-posterior) error signal.
@@ -240,7 +229,6 @@ def propagation_step(
                     params=params[i],
                     update_type=update_type,
                     has_volatility_parent=volatility_parents[i],
-                    max_posterior_precision=max_posterior_precision,
                 )
 
     # ========== LEARNING PHASE (after inference converges) ==========
