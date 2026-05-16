@@ -20,11 +20,11 @@ RESULTS_PATH = os.path.join(RESULTS_DIR, "sweep_cifar_kinds.csv")
 
 TONIC_VOL = -10.0
 LR        = 0.0001
-EPOCHS    = 5
+EPOCHS    = 10
 N_TRAIN   = 20_000
 SEED      = 0
 
-KINDS = ["standard", "precision_weighted", "precision_ratio", "map_natural", "pure_natural"]
+KINDS = ["standard", "precision_weighted", "precision_ratio"]
 
 leaky_relu = lambda x: jnp.where(x > 0, x, 0.01 * x)
 

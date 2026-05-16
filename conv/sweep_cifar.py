@@ -20,12 +20,12 @@ RESULTS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results
 RESULTS_PATH = os.path.join(RESULTS_DIR, "sweep_cifar.csv")
 
 TONIC_VOL = -10.0
-EPOCHS    = 20
+EPOCHS    = 10
 N_TRAIN   = 20_000
 SEED      = 0
 
-LRS   = [0.1, 0.01, 0.001, 0.0001]
-KINDS = ["standard", "precision_weighted", "precision_ratio", "map_natural", "pure_natural"]
+LRS   = [0.001, 0.0005, 0.0001]
+KINDS = ["standard", "precision_weighted", "precision_ratio"]
 
 leaky_relu = lambda x: jnp.where(x > 0, x, 0.01 * x)
 
@@ -41,7 +41,7 @@ def build_network(seed):
     net = DeepNetwork(coupling_fn=leaky_relu)
     net.add_layer(size=10, kind="binary",
                   tonic_volatility=TONIC_VOL, tonic_volatility_vol=TONIC_VOL,
-                  add_constant_input=False, volatility_parent=False)
+                  add_constant_input=False)
     net.add_layer(size=512,
                   tonic_volatility=TONIC_VOL, tonic_volatility_vol=TONIC_VOL,
                   add_constant_input=True, volatility_parent=False)
