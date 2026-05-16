@@ -24,7 +24,7 @@ OUTPUT_DIM    = 10
 TONIC_VOL     = -10.0
 TONIC_VOL_VOL = -4.0
 LR            = 0.001
-EPOCHS        = 20
+EPOCHS        = 10
 SEED          = 0
 
 leaky_relu = lambda x: jax.nn.leaky_relu(x, negative_slope=0.01)
@@ -40,7 +40,7 @@ def build_network(seed):
     net.add_layer(size=OUTPUT_DIM, kind="binary",
                   tonic_volatility=TONIC_VOL,
                   tonic_volatility_vol=TONIC_VOL_VOL,
-                  add_constant_input=True,
+                  add_constant_input=False,
                   volatility_parent=False)
     for width in [32, 32]:
         net.add_layer(size=width,
