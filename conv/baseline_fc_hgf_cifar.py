@@ -24,7 +24,7 @@ OUTPUT_DIM    = 10
 TONIC_VOL     = -10.0
 TONIC_VOL_VOL = -4.0
 LR            = 0.001
-EPOCHS        = 50
+EPOCHS        = 20
 SEED          = 0
 
 leaky_relu = lambda x: jax.nn.leaky_relu(x, negative_slope=0.01)
