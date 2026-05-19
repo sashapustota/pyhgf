@@ -28,7 +28,9 @@ RESULTS_PATH = os.path.join(RESULTS_DIR, "conv_hgf_cifar.csv")
 
 TONIC_VOL     = -10.0
 TONIC_VOL_VOL = -10.0
-LR            = 0.0001
+BASE_LR       = 0.0001
+BATCH_SIZE    = 32
+LR            = BASE_LR * BATCH_SIZE   # linear scaling rule: lr ∝ batch_size
 LEARNING_KIND = "standard"
 EPOCHS        = 50
 SEED          = 0
@@ -72,9 +74,10 @@ def evaluate(net):
     return 100.0 * (np.argmax(preds, axis=1) == y_te).mean()
 
 # ── JIT warm-up ───────────────────────────────────────────────────────────────
+print(f"LR={LR}  (base={BASE_LR} × batch={BATCH_SIZE})", flush=True)
 print("JIT warm-up...", flush=True)
 _net = build_network(seed=0)
-_net.fit(X_tr[:4], Y_tr[:4], lr=LR, learning_kind=LEARNING_KIND)
+_net.fit(X_tr[:4], Y_tr[:4], lr=LR, learning_kind=LEARNING_KIND, batch_size=BATCH_SIZE)
 print("Done.\n", flush=True)
 
 # ── Train ─────────────────────────────────────────────────────────────────────
@@ -94,7 +97,7 @@ with open(RESULTS_PATH, "a", newline="") as f:
 
 for epoch in range(1, EPOCHS + 1):
     idx = rng.permutation(len(X_tr))
-    net.fit(X_tr[idx], Y_tr[idx], lr=LR, learning_kind=LEARNING_KIND)
+    net.fit(X_tr[idx], Y_tr[idx], lr=LR, learning_kind=LEARNING_KIND, batch_size=BATCH_SIZE)
     acc = evaluate(net)
     print(f"Epoch {epoch:>2}/{EPOCHS}  acc={acc:.2f}%", flush=True)
     with open(RESULTS_PATH, "a", newline="") as f:
