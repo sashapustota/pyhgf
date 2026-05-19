@@ -27,8 +27,9 @@ RESULTS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results
 RESULTS_PATH = os.path.join(RESULTS_DIR, "conv_hgf_cifar.csv")
 
 TONIC_VOL     = -10.0
-TONIC_VOL_VOL = -4.0
-LR            = 0.001
+TONIC_VOL_VOL = -10.0
+LR            = 0.0001
+LEARNING_KIND = "standard"
 EPOCHS        = 50
 SEED          = 0
 
@@ -73,7 +74,7 @@ def evaluate(net):
 # ── JIT warm-up ───────────────────────────────────────────────────────────────
 print("JIT warm-up...", flush=True)
 _net = build_network(seed=0)
-_net.fit(X_tr[:4], Y_tr[:4], lr=LR, learning_kind="precision_weighted")
+_net.fit(X_tr[:4], Y_tr[:4], lr=LR, learning_kind=LEARNING_KIND)
 print("Done.\n", flush=True)
 
 # ── Train ─────────────────────────────────────────────────────────────────────
@@ -85,9 +86,15 @@ with open(RESULTS_PATH, "w", newline="") as f:
 rng = np.random.default_rng(SEED)
 net = build_network(SEED)
 
+acc0 = evaluate(net)
+print(f"Epoch  0/{EPOCHS}  acc={acc0:.2f}%  (init, should be ~10%)", flush=True)
+with open(RESULTS_PATH, "a", newline="") as f:
+    csv.DictWriter(f, fieldnames=FIELDNAMES).writerow(
+        {"epoch": 0, "test_acc": round(acc0, 4)})
+
 for epoch in range(1, EPOCHS + 1):
     idx = rng.permutation(len(X_tr))
-    net.fit(X_tr[idx], Y_tr[idx], lr=LR, learning_kind="precision_weighted")
+    net.fit(X_tr[idx], Y_tr[idx], lr=LR, learning_kind=LEARNING_KIND)
     acc = evaluate(net)
     print(f"Epoch {epoch:>2}/{EPOCHS}  acc={acc:.2f}%", flush=True)
     with open(RESULTS_PATH, "a", newline="") as f:
