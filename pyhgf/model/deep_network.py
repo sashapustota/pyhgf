@@ -210,6 +210,7 @@ class DeepNetwork:
         self._record_trajectories: bool = False
         self._propagation_weight_update: bool = True
         self._propagation_max_posterior_precision: Optional[float] = None
+        self._propagation_batch_size: int = 1
         self._prediction_fn: Optional[Callable] = None
 
     def add_layer(
@@ -536,7 +537,7 @@ class DeepNetwork:
                     else:
                         weights.append(jnp.eye(child_size, n_parent_cols))
 
-        # Adam moment buffers (zeros, matching weight structures)
+        # Adam moment buffers and gradient accumulators (zeros, matching weight structures)
         adam_m = tuple(
             (jnp.zeros_like(w[0]), jnp.zeros_like(w[1]))
             if isinstance(w, tuple)
@@ -544,6 +545,12 @@ class DeepNetwork:
             for w in weights
         )
         adam_v = tuple(
+            (jnp.zeros_like(w[0]), jnp.zeros_like(w[1]))
+            if isinstance(w, tuple)
+            else jnp.zeros_like(w)
+            for w in weights
+        )
+        grad_accum = tuple(
             (jnp.zeros_like(w[0]), jnp.zeros_like(w[1]))
             if isinstance(w, tuple)
             else jnp.zeros_like(w)
@@ -558,6 +565,8 @@ class DeepNetwork:
             adam_m=adam_m,
             adam_v=adam_v,
             adam_t=0,
+            grad_accum=grad_accum,
+            grad_step=0,
         )
 
     def weight_initialisation(
@@ -646,6 +655,8 @@ class DeepNetwork:
             adam_m=self.state.adam_m,
             adam_v=self.state.adam_v,
             adam_t=self.state.adam_t,
+            grad_accum=self.state.grad_accum,
+            grad_step=self.state.grad_step,
         )
         return self
 
@@ -656,6 +667,7 @@ class DeepNetwork:
         params: Optional[dict] = None,
         record_trajectories: bool = False,
         weight_update: bool = True,
+        batch_size: int = 1,
     ):
         """Create the jitted propagation function.
 
@@ -726,6 +738,7 @@ class DeepNetwork:
                     weight_update,
                     max_posterior_precision,
                     conv_specs,
+                    batch_size,
                 )
                 return new_state, (new_state, output_pred)
 
@@ -747,6 +760,7 @@ class DeepNetwork:
                     weight_update,
                     max_posterior_precision,
                     conv_specs,
+                    batch_size,
                 )
 
         return jax.jit(_step)
@@ -829,6 +843,7 @@ class DeepNetwork:
         params: Optional[dict] = None,
         record_trajectories: bool = False,
         weight_update: bool = True,
+        batch_size: int = 1,
     ) -> "DeepNetwork":
         """Fit network to data.
 
@@ -866,6 +881,11 @@ class DeepNetwork:
             weights and run only the inference (prediction → PE → posterior)
             cycle — useful for evaluating a fixed model on new data while
             still recording trajectories.
+        batch_size :
+            Number of samples over which gradients are accumulated before a
+            single weight update is applied.  ``1`` (default) keeps the
+            original per-sample update behaviour.  Changing this value
+            triggers a JIT retrace.
 
         Returns
         -------
@@ -889,16 +909,18 @@ class DeepNetwork:
             or self._record_trajectories != record_trajectories
             or self._propagation_weight_update != weight_update
             or self._propagation_max_posterior_precision != self.max_posterior_precision
+            or self._propagation_batch_size != batch_size
         )
         if needs_retrace:
             self._propagation_fn = self._create_propagation_fn(
-                lr, learning_kind, params, record_trajectories, weight_update
+                lr, learning_kind, params, record_trajectories, weight_update, batch_size
             )
             self._propagation_lr = lr
             self._propagation_learning_kind = learning_kind
             self._record_trajectories = record_trajectories
             self._propagation_weight_update = weight_update
             self._propagation_max_posterior_precision = self.max_posterior_precision
+            self._propagation_batch_size = batch_size
 
         # Convert to JAX arrays
         x = jnp.asarray(x)

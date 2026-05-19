@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional, Union
 
+import jax
 import jax.numpy as jnp
 from jax.nn import sigmoid
 
@@ -15,13 +16,21 @@ from pyhgf.updates.vectorized.binary import (
     vectorized_binary_prediction,
     vectorized_binary_prediction_error,
 )
-from pyhgf.updates.vectorized.conv_learning import vectorized_conv_weight_update
+from pyhgf.updates.vectorized.conv_learning import (
+    _apply_conv_gradient,
+    _compute_conv_gradient,
+    vectorized_conv_weight_update,
+)
 from pyhgf.updates.vectorized.conv_prediction import (
     vectorized_conv_parent_posterior_from_conv,
     vectorized_conv_parent_posterior_from_fc,
     vectorized_conv_prediction,
 )
-from pyhgf.updates.vectorized.learning import vectorized_weight_update
+from pyhgf.updates.vectorized.learning import (
+    _apply_fc_gradient,
+    _compute_fc_gradient,
+    vectorized_weight_update,
+)
 from pyhgf.updates.vectorized.volatile import (
     vectorized_layer_posterior_update,
     vectorized_layer_prediction,
@@ -44,6 +53,7 @@ def propagation_step(
     weight_update: bool = True,
     max_posterior_precision: float = 1e10,
     conv_specs: Optional[list] = None,
+    batch_size: int = 1,
 ) -> tuple[NetworkState, jnp.ndarray]:
     """Single propagation step through the network.
 
@@ -94,6 +104,11 @@ def propagation_step(
     conv_specs :
         Per-layer conv spec dicts (``None`` for FC layers). Required when any
         ``layer_kinds`` element is ``"conv"``.
+    batch_size :
+        Number of samples over which gradients are accumulated before applying
+        a single weight update.  ``1`` (default) recovers the original
+        per-sample update behaviour.  Must be a compile-time constant (captured
+        at JIT trace time).
 
     Returns
     -------
@@ -231,73 +246,117 @@ def propagation_step(
                     has_volatility_parent=volatility_parents[i],
                 )
 
-    # ========== LEARNING PHASE (after inference converges) ==========
-    # Update weights once using converged activities — skipped when
-    # ``weight_update=False`` so the same network can be used for pure
-    # inference (forward + posterior + PE only).
-    use_adam = lr == "adam"
-    adam_t = state.adam_t + 1 if (use_adam and weight_update) else state.adam_t
+    # ========== LEARNING PHASE ==========
+    # Gradients are accumulated over ``batch_size`` samples; a single averaged
+    # weight update is applied every ``batch_size`` steps via jax.lax.cond.
+    # When ``batch_size=1`` the condition is always true → identical to the
+    # original per-sample behaviour.
+
+    # Resolve Adam hyper-parameters (needed inside the cond branches).
+    if adam_params is not None:
+        beta1, beta2, epsilon, _adam_lr_override = adam_params
+        _adam_lr = _adam_lr_override if _adam_lr_override is not None else 1e-3
+    else:
+        beta1, beta2, epsilon, _adam_lr = 0.9, 0.999, 1e-8, 1e-3
 
     adam_m_list = list(state.adam_m)
     adam_v_list = list(state.adam_v)
+    accum_list = list(state.grad_accum)
+    new_grad_step = state.grad_step + 1 if weight_update else state.grad_step
 
     if weight_update:
-        if adam_params is not None:
-            beta1, beta2, epsilon, _adam_lr_override = adam_params
-            _adam_lr = _adam_lr_override if _adam_lr_override is not None else 1e-3
-        else:
-            beta1, beta2, epsilon, _adam_lr = 0.9, 0.999, 1e-8, 1e-3
-
+        # --- 1. Compute raw gradient for each weight layer this sample -------
+        raw_grads = []
         for i in range(1, n_layers):
             w = weights[i - 1]
             if isinstance(w, tuple):
-                # Conv weight update
                 spec = conv_specs[i - 1]
-                new_w, new_m, new_v = vectorized_conv_weight_update(
+                gk, gb = _compute_conv_gradient(
                     child_state=layers[i - 1],
                     parent_state=layers[i],
                     kernel=w[0],
                     bias=w[1],
                     coupling_fn=coupling_fns[i],
-                    lr=lr,
                     stride=spec["stride"],
                     padding=spec["padding"],
                     pool=spec["pool"],
                     pool_size=spec["pool_size"],
                     pool_stride=spec["pool_stride"],
                     kind=learning_kind,
-                    adam_m=adam_m_list[i - 1] if use_adam else None,
-                    adam_v=adam_v_list[i - 1] if use_adam else None,
-                    adam_t=adam_t,
-                    adam_lr=_adam_lr,
-                    adam_beta1=beta1,
-                    adam_beta2=beta2,
-                    adam_epsilon=epsilon,
                 )
-                weights[i - 1] = new_w
+                raw_grads.append((gk, gb))
             else:
-                # FC weight update
-                new_w, new_m, new_v = vectorized_weight_update(
+                raw_grads.append(_compute_fc_gradient(
                     parent_state=layers[i],
                     child_state=layers[i - 1],
-                    weights=w,
                     coupling_fn=coupling_fns[i],
                     kind=learning_kind,
-                    lr=lr,
                     parent_has_constant=add_constant_inputs[i],
                     child_is_binary=(layer_kinds[i - 1] == "binary"),
-                    adam_m=adam_m_list[i - 1] if use_adam else None,
-                    adam_v=adam_v_list[i - 1] if use_adam else None,
-                    adam_t=adam_t,
-                    adam_lr=_adam_lr,
-                    adam_beta1=beta1,
-                    adam_beta2=beta2,
-                    adam_epsilon=epsilon,
-                )
-                weights[i - 1] = new_w
-            if use_adam and new_m is not None:
-                adam_m_list[i - 1] = new_m
-                adam_v_list[i - 1] = new_v
+                ))
+
+        # --- 2. Accumulate ---------------------------------------------------
+        new_accum = tuple(
+            (a[0] + g[0], a[1] + g[1]) if isinstance(g, tuple) else a + g
+            for a, g in zip(accum_list, raw_grads)
+        )
+
+        # --- 3. Conditionally apply via jax.lax.cond -------------------------
+        # Both branches must return the same pytree structure:
+        #   (weights, adam_m, adam_v, grad_accum, adam_t)
+        # where each element mirrors the corresponding list of per-layer arrays.
+
+        def _apply_branch(carry):
+            accum, ws, ms, vs, t = carry
+            new_t = t + 1  # increment Adam timestep on actual weight-update step
+            new_ws, new_ms, new_vs = [], [], []
+            for w, a, m, v in zip(ws, accum, ms, vs):
+                if isinstance(w, tuple):
+                    avg_gk = a[0] / batch_size
+                    avg_gb = a[1] / batch_size
+                    nw, nm, nv = _apply_conv_gradient(
+                        avg_gk, avg_gb, w[0], w[1], lr,
+                        m, v, new_t, _adam_lr, beta1, beta2, epsilon,
+                    )
+                else:
+                    avg_g = a / batch_size
+                    nw, nm, nv = _apply_fc_gradient(
+                        avg_g, w, lr, m, v, new_t,
+                        _adam_lr, beta1, beta2, epsilon,
+                    )
+                new_ws.append(nw)
+                new_ms.append(nm)
+                new_vs.append(nv)
+            zero_accum = tuple(
+                (jnp.zeros_like(a[0]), jnp.zeros_like(a[1]))
+                if isinstance(a, tuple) else jnp.zeros_like(a)
+                for a in accum
+            )
+            return tuple(new_ws), tuple(new_ms), tuple(new_vs), zero_accum, new_t
+
+        def _skip_branch(carry):
+            accum, ws, ms, vs, t = carry
+            return ws, ms, vs, accum, t
+
+        operand = (
+            new_accum,
+            tuple(weights),
+            tuple(adam_m_list),
+            tuple(adam_v_list),
+            state.adam_t,
+        )
+        new_weights_t, new_ms_t, new_vs_t, final_accum, new_adam_t = jax.lax.cond(
+            new_grad_step % batch_size == 0,
+            _apply_branch,
+            _skip_branch,
+            operand,
+        )
+        weights = list(new_weights_t)
+        adam_m_list = list(new_ms_t)
+        adam_v_list = list(new_vs_t)
+        accum_list = list(final_accum)
+    else:
+        new_adam_t = state.adam_t
 
     new_state = NetworkState(
         layers=tuple(layers),
@@ -306,10 +365,11 @@ def propagation_step(
         time_step=state.time_step,
         adam_m=tuple(adam_m_list),
         adam_v=tuple(adam_v_list),
-        adam_t=adam_t,
+        adam_t=new_adam_t,
+        grad_accum=tuple(accum_list),
+        grad_step=new_grad_step,
     )
 
-    # Return output prediction for monitoring
     output_pred = layers[0].expected_mean
 
     return new_state, output_pred

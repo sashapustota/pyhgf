@@ -191,7 +191,9 @@ class NetworkState(NamedTuple):
     time_step: float
     adam_m: tuple  # tuple[Array, ...] - first moment estimates (same shapes as weights)
     adam_v: tuple  # tuple[Array, ...] - second moment estimates
-    adam_t: int  # global timestep counter
+    adam_t: int  # global timestep counter (counts actual weight-update steps)
+    grad_accum: tuple  # accumulated raw gradients, same structure as weights
+    grad_step: int  # samples accumulated since last weight update
 
     @property
     def n_layers(self) -> int:

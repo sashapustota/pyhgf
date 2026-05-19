@@ -122,10 +122,31 @@ def vectorized_weight_update(
             f"Unknown lr value '{lr}'. Expected a non-negative float or 'adam'."
         )
 
-    # Prediction error at child layer
-    pe = child_state.mean - child_state.expected_mean
+    gradient = _compute_fc_gradient(
+        parent_state, child_state, coupling_fn, kind, parent_has_constant, child_is_binary
+    )
+    new_weights, new_m, new_v = _apply_fc_gradient(
+        gradient, weights, lr,
+        adam_m if adam_m is not None else jnp.zeros_like(weights),
+        adam_v if adam_v is not None else jnp.zeros_like(weights),
+        adam_t, adam_lr, adam_beta1, adam_beta2, adam_epsilon,
+    )
+    if lr != "adam":
+        new_m = None
+        new_v = None
+    return new_weights, new_m, new_v
 
-    # Coupled parent activation
+
+def _compute_fc_gradient(
+    parent_state: LayerState,
+    child_state: LayerState,
+    coupling_fn: Callable,
+    kind: str = "precision_weighted",
+    parent_has_constant: bool = False,
+    child_is_binary: bool = False,
+) -> jnp.ndarray:
+    """Compute the raw FC weight gradient without applying any lr scaling."""
+    pe = child_state.mean - child_state.expected_mean
     parent_mean = parent_state.mean
     parent_precision = parent_state.precision
     if parent_mean.ndim > 1:
@@ -138,42 +159,42 @@ def vectorized_weight_update(
             jnp.array([jnp.mean(parent_precision)]),
         ])
     coupled_parent = coupling_fn(parent_mean)
-
-    # Base outer product: PE ⊗ g(parent)
     base_delta = pe[:, None] * coupled_parent[None, :]
-
-    # Compute the gradient according to *kind*
     if kind == "precision_ratio":
         kalman_gain = child_state.precision[:, None] / (
             parent_precision[None, :] + child_state.precision[:, None]
         )
-        gradient = base_delta * kalman_gain
+        return base_delta * kalman_gain
     elif kind == "precision_weighted" and not child_is_binary:
-        gradient = base_delta * child_state.precision[:, None]
-    else:  # "standard", or binary child where Bernoulli variance must not be doubled
-        gradient = base_delta
+        return base_delta * child_state.precision[:, None]
+    else:
+        return base_delta
 
-    # Apply *lr* uniformly across all kinds
+
+def _apply_fc_gradient(
+    gradient: jnp.ndarray,
+    weights: jnp.ndarray,
+    lr: Union[float, str],
+    adam_m: jnp.ndarray,
+    adam_v: jnp.ndarray,
+    adam_t: int,
+    adam_lr: float = 1e-3,
+    adam_beta1: float = 0.9,
+    adam_beta2: float = 0.999,
+    adam_epsilon: float = 1e-8,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Apply a pre-computed gradient to FC weights; always returns (weights, m, v)."""
     if lr == "adam":
-        assert adam_m is not None and adam_v is not None, (
-            "adam_m and adam_v must be provided when lr='adam'"
-        )
         new_m = adam_beta1 * adam_m + (1.0 - adam_beta1) * gradient
         new_v = adam_beta2 * adam_v + (1.0 - adam_beta2) * gradient**2
         m_hat = new_m / (1.0 - adam_beta1**adam_t)
         v_hat = new_v / (1.0 - adam_beta2**adam_t)
-        coupling_delta = adam_lr * m_hat / (jnp.sqrt(v_hat) + adam_epsilon)
+        delta = adam_lr * m_hat / (jnp.sqrt(v_hat) + adam_epsilon)
     else:
-        coupling_delta = gradient * float(lr)
-        new_m = None
-        new_v = None
-
-    # Guard against NaN / inf
-    coupling_delta = jnp.where(
-        jnp.isnan(coupling_delta) | jnp.isinf(coupling_delta), 0.0, coupling_delta
-    )
-
-    new_weights = weights + coupling_delta
+        delta = gradient * float(lr)
+        new_m = adam_m
+        new_v = adam_v
+    delta = jnp.where(jnp.isnan(delta) | jnp.isinf(delta), 0.0, delta)
+    new_weights = weights + delta
     new_weights = jnp.where(jnp.isinf(new_weights), weights, new_weights)
-
     return new_weights, new_m, new_v

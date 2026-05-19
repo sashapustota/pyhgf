@@ -76,14 +76,42 @@ def vectorized_conv_weight_update(
     new_adam_v :
         Updated Adam second moments (or ``None``).
     """
-    pe = child_state.mean - child_state.expected_mean  # (out_ch, H_out, W_out)
+    grad_k, grad_b = _compute_conv_gradient(
+        child_state, parent_state, kernel, bias, coupling_fn,
+        stride, padding, pool, pool_size, pool_stride, kind,
+    )
+    km = adam_m[0] if adam_m is not None else jnp.zeros_like(kernel)
+    bm = adam_m[1] if adam_m is not None else jnp.zeros_like(bias)
+    kv = adam_v[0] if adam_v is not None else jnp.zeros_like(kernel)
+    bv = adam_v[1] if adam_v is not None else jnp.zeros_like(bias)
+    new_weights, new_m, new_v = _apply_conv_gradient(
+        grad_k, grad_b, kernel, bias, lr,
+        (km, bm), (kv, bv), adam_t,
+        adam_lr, adam_beta1, adam_beta2, adam_epsilon,
+    )
+    if lr != "adam":
+        new_m = None
+        new_v = None
+    return new_weights, new_m, new_v
 
-    if kind == "precision_weighted":
-        pe_weighted = pe * child_state.precision
-    else:
-        pe_weighted = pe  # standard
 
-    parent_acts = coupling_fn(parent_state.mean)  # (in_ch, H_in, W_in)
+def _compute_conv_gradient(
+    child_state: LayerState,
+    parent_state: LayerState,
+    kernel: jnp.ndarray,
+    bias: jnp.ndarray,
+    coupling_fn: Callable,
+    stride: int = 1,
+    padding: str = "SAME",
+    pool: bool = False,
+    pool_size: int = 2,
+    pool_stride: int = 2,
+    kind: str = "precision_weighted",
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Compute raw (grad_kernel, grad_bias) without applying any lr scaling."""
+    pe = child_state.mean - child_state.expected_mean
+    pe_weighted = pe * child_state.precision if kind == "precision_weighted" else pe
+    parent_acts = coupling_fn(parent_state.mean)
 
     def _proxy(k, b):
         out = jax.lax.conv_general_dilated(
@@ -105,13 +133,27 @@ def vectorized_conv_weight_update(
             )
         return jnp.sum(out * pe_weighted)
 
-    grad_k, grad_b = jax.grad(_proxy, argnums=(0, 1))(kernel, bias)
+    return jax.grad(_proxy, argnums=(0, 1))(kernel, bias)
 
+
+def _apply_conv_gradient(
+    grad_k: jnp.ndarray,
+    grad_b: jnp.ndarray,
+    kernel: jnp.ndarray,
+    bias: jnp.ndarray,
+    lr: Union[float, str],
+    adam_m: tuple,
+    adam_v: tuple,
+    adam_t: int,
+    adam_lr: float = 1e-3,
+    adam_beta1: float = 0.9,
+    adam_beta2: float = 0.999,
+    adam_epsilon: float = 1e-8,
+) -> tuple:
+    """Apply pre-computed conv gradients; always returns (weights, m, v)."""
+    km, bm = adam_m
+    kv, bv = adam_v
     if lr == "adam":
-        assert adam_m is not None and adam_v is not None
-        km, bm = adam_m
-        kv, bv = adam_v
-
         new_km = adam_beta1 * km + (1.0 - adam_beta1) * grad_k
         new_kv = adam_beta2 * kv + (1.0 - adam_beta2) * grad_k**2
         km_hat = new_km / (1.0 - adam_beta1**adam_t)
@@ -129,13 +171,9 @@ def vectorized_conv_weight_update(
     else:
         dk = float(lr) * grad_k
         db = float(lr) * grad_b
-        new_m = None
-        new_v = None
+        new_m = (km, bm)
+        new_v = (kv, bv)
 
     dk = jnp.where(jnp.isnan(dk) | jnp.isinf(dk), 0.0, dk)
     db = jnp.where(jnp.isnan(db) | jnp.isinf(db), 0.0, db)
-
-    new_kernel = kernel + dk
-    new_bias = bias + db
-
-    return (new_kernel, new_bias), new_m, new_v
+    return (kernel + dk, bias + db), new_m, new_v
