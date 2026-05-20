@@ -95,10 +95,14 @@ def vectorized_layer_prediction(
     coupled_parents = coupling_fn(parent_mean)
     drift = jnp.matmul(weights, coupled_parents)
 
-    # Expected mean for value level
-    # Note: autoconnection_strength = 0 for i.i.d. classification
-    # (the previous observation should not bias the next prediction)
-    expected_mean = time_step * drift
+    # Expected mean for value level.
+    # When autoconnection > 0 the layer acts as a leaky integrator: the previous
+    # posterior mean squashed by coupling_fn is carried forward with weight
+    # `autoconnection`, and the top-down drive contributes the rest.
+    # Squashing is essential for stability: without it the carried mean is unbounded
+    # and drives volatility_pe to overflow within the first epoch.
+    # The default (autoconnection=0.0) preserves the original feedforward behaviour.
+    expected_mean = params.autoconnection * coupling_fn(child_state.mean) + time_step * drift
 
     if has_volatility_parent:
         # Total volatility includes contribution from internal volatility level

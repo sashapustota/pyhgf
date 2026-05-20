@@ -33,6 +33,7 @@ _LAYER_PARAM_DEFAULTS: dict[str, float] = {
     "tonic_volatility": -4.0,
     "tonic_volatility_vol": -4.0,
     "volatility_coupling": 1.0,
+    "autoconnection": 0.0,
 }
 
 # Names of fields that can be overridden per layer.

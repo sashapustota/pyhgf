@@ -129,6 +129,7 @@ class LayerParams(NamedTuple):
     tonic_volatility: Array  # Value level tonic volatility
     tonic_volatility_vol: Array  # Volatility level tonic volatility
     volatility_coupling: Array  # Internal volatility coupling strength
+    autoconnection: Array  # Value-level autoconnection strength (0 = feedforward, 1 = full recurrence)
 
     @classmethod
     def create(
@@ -137,6 +138,7 @@ class LayerParams(NamedTuple):
         tonic_volatility: float = -4.0,
         tonic_volatility_vol: float = -4.0,
         volatility_coupling: float = 1.0,
+        autoconnection: float = 0.0,
     ) -> "LayerParams":
         """Create LayerParams with specified values.
 
@@ -150,6 +152,12 @@ class LayerParams(NamedTuple):
             Volatility level tonic volatility (log scale).
         volatility_coupling :
             Internal volatility coupling strength.
+        autoconnection :
+            Value-level autoconnection strength. ``0.0`` (default) gives the original
+            feedforward behaviour suited for i.i.d. data. Values in ``(0, 1)`` make
+            the value level act as a leaky integrator:
+            ``expected_mean = autoconnection * prev_mean + time_step * drift``.
+            Set per-layer via ``add_layer(autoconnection=...)``.
 
         Returns
         -------
@@ -160,6 +168,7 @@ class LayerParams(NamedTuple):
             tonic_volatility=jnp.full(n_nodes, tonic_volatility),
             tonic_volatility_vol=jnp.full(n_nodes, tonic_volatility_vol),
             volatility_coupling=jnp.full(n_nodes, volatility_coupling),
+            autoconnection=jnp.full(n_nodes, autoconnection),
         )
 
 
