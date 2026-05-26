@@ -22,3 +22,10 @@ pyhgf/*.so
 uv.lock
 Cargo.lock
 .python-version
+
+# experiments/ — generated and downloaded artefacts
+experiments/results/
+experiments/data/
+experiments/*_embeddings/
+experiments/__pycache__/
+experiments/*.png
