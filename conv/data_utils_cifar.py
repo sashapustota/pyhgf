@@ -48,3 +48,22 @@ def load_cifar10(data_dir: str):
     print(f"  Train: {X_tr.shape} | Test: {X_te.shape}\n", flush=True)
 
     return X_tr, y_tr, X_te, y_te
+
+
+def augment(X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Random horizontal flip + random crop with padding 4 (CIFAR standard augmentation)."""
+    N, C, H, W = X.shape
+    X = X.copy()
+
+    # Random horizontal flip
+    flip = rng.random(N) < 0.5
+    X[flip] = X[flip, :, :, ::-1]
+
+    # Random crop: pad by 4, then crop back to 32×32
+    pad = 4
+    X_pad = np.pad(X, ((0, 0), (0, 0), (pad, pad), (pad, pad)), mode="reflect")
+    tops  = rng.integers(0, 2 * pad, size=N)
+    lefts = rng.integers(0, 2 * pad, size=N)
+    X = np.stack([X_pad[i, :, tops[i]:tops[i] + H, lefts[i]:lefts[i] + W] for i in range(N)])
+
+    return X
