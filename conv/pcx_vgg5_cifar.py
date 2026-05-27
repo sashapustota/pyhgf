@@ -138,9 +138,9 @@ schedule = optax.warmup_cosine_decay_schedule(
 
 with pxu.step(model, pxc.STATUS.INIT, clear_params=pxc.VodeParam.Cache):
     forward(jnp.zeros((BATCH_SIZE, 3, 32, 32)), None, model=model)
-    optim_h = pxu.Optim(optax.sgd(X_LR, momentum=X_MOM),
+    optim_h = pxu.Optim(lambda: optax.sgd(X_LR, momentum=X_MOM),
                         pxu.M(pxc.VodeParam)(model))
-    optim_w = pxu.Optim(optax.adamw(schedule, weight_decay=W_WD),
+    optim_w = pxu.Optim(lambda: optax.adamw(schedule, weight_decay=W_WD),
                         pxu.M(pxnn.LayerParam)(model))
 
 print(f"T={T}  batch_size={BATCH_SIZE}  epochs={NM_EPOCHS}", flush=True)
