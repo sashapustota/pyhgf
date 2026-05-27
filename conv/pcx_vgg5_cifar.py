@@ -54,11 +54,12 @@ class VGG5(pxc.EnergyModule):
              self.act_fn, pxnn.MaxPool2d(kernel_size=2, stride=2)),
             (pxnn.Conv2d(256, 512, kernel_size=(3,3), padding=(1,1)),
              self.act_fn, pxnn.MaxPool2d(kernel_size=2, stride=2)),
-            (pxnn.Conv2d(512, 512, kernel_size=(3,3), padding=(1,1)),
+            # Paper Table: last conv has padding=0 → 4×4 → 2×2 → pool → 1×1
+            (pxnn.Conv2d(512, 512, kernel_size=(3,3), padding=(0,0)),
              self.act_fn, pxnn.MaxPool2d(kernel_size=2, stride=2)),
         ]
         self.classifier_layers = [
-            (pxnn.Linear(512 * 2 * 2, self.nm_classes.get()),),
+            (pxnn.Linear(512 * 1 * 1, self.nm_classes.get()),),
         ]
         self.vodes = (
             [pxc.Vode() for _ in self.feature_layers] +
