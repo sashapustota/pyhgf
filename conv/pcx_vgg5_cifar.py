@@ -27,7 +27,7 @@ import pcx.utils as pxu
 import pcx.functional as pxf
 
 RESULTS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-RESULTS_PATH = os.path.join(RESULTS_DIR, "pcx_vgg5_cifar.csv")
+RESULTS_PATH = os.path.join(RESULTS_DIR, "pcx_vgg5_cifar_hardtanh.csv")
 
 BATCH_SIZE = 128
 NM_EPOCHS  = 50
@@ -127,7 +127,7 @@ steps_per_epoch = len(X_tr) // BATCH_SIZE
 total_steps     = steps_per_epoch * NM_EPOCHS
 
 # ── Model + optimisers ────────────────────────────────────────────────────────
-model = VGG5(nm_classes=10, act_fn=jax.nn.gelu)
+model = VGG5(nm_classes=10, act_fn=jax.nn.hard_tanh)
 
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=W_LR,
