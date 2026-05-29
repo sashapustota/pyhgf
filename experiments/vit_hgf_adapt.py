@@ -51,6 +51,7 @@ RESULTS_DIR = Path(__file__).parent / "results"
 sys.path.insert(0, str(ROOT))
 
 from pyhgf.model import DeepNetwork
+from pyhgf.typing import LayerState
 
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 EMBED_DIM  = 768
@@ -281,9 +282,18 @@ def hgf_adapt_step_cached(vit, hgf_block11, probe, tokens_cls, h11, labels, step
     hgf_block11.fit(
         h_flat.astype(np.float32),
         target.astype(np.float32),
-        lr="adam",
+        lr=step_size,
         learning_kind="precision_weighted",
     )
+
+
+def _reset_hgf_layer_states(hgf: DeepNetwork) -> None:
+    """Reset layer means/precisions to initial values; keep weights."""
+    new_layers = tuple(
+        LayerState.default(layer.mean.shape[0])
+        for layer in hgf.state.layers
+    )
+    hgf.state = hgf.state._replace(layers=new_layers)
 
 
 def run_hgf_adapt(vit, hgf_block11, probe, train_splits, test_splits, step_size, rng):
@@ -291,6 +301,7 @@ def run_hgf_adapt(vit, hgf_block11, probe, train_splits, test_splits, step_size,
     acc_matrix = np.full((N_TASKS, N_TASKS), np.nan)
 
     for t, (tr_cls, tr_h11, tr_labels) in enumerate(train_splits):
+        _reset_hgf_layer_states(hgf_block11)   # fresh precision each task
         w_before = [np.array(w).copy() for w in hgf_block11.state.weights]
 
         idx = rng.permutation(len(tr_labels))
