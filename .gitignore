@@ -29,3 +29,4 @@ experiments/data/
 experiments/*_embeddings/
 experiments/__pycache__/
 experiments/*.png
+experiments/paper_experiments/

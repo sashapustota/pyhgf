@@ -121,7 +121,7 @@ def vectorized_layer_volatility_posterior_standard(
         - 0.5 * (vol_coupling**2) * eff_prec * volatility_pe
     )
     posterior_precision_vol = jnp.clip(
-        layer.expected_precision_vol + precision_vol_contrib, a_max=1e8
+        layer.expected_precision_vol + precision_vol_contrib, max=1e8
     )
 
     # Mean using updated precision
@@ -178,7 +178,7 @@ def vectorized_layer_volatility_posterior_ehgf(
         - 0.5 * (vol_coupling**2) * eff_prec * volatility_pe
     )
     posterior_precision_vol = jnp.clip(
-        layer.expected_precision_vol + precision_vol_contrib, a_max=1e8
+        layer.expected_precision_vol + precision_vol_contrib, max=1e8
     )
 
     return layer._replace(
