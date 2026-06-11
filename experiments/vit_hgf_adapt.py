@@ -290,7 +290,7 @@ def hgf_adapt_step_cached(vit, hgf_block11, probe, tokens_cls, h11, labels, step
 def _reset_hgf_layer_states(hgf: DeepNetwork) -> None:
     """Reset layer means/precisions to initial values; keep weights."""
     new_layers = tuple(
-        LayerState.default(layer.mean.shape[0])
+        LayerState.create(layer.mean.shape[0])
         for layer in hgf.state.layers
     )
     hgf.state = hgf.state._replace(layers=new_layers)
