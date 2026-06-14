@@ -1,11 +1,11 @@
 """Phase 2: Conv-HGF on CIFAR-10.
 
-Architecture (VGG5-like, 4 conv blocks + optional FC head):
+Architecture (VGG5, matching PCX channel widths and spatial output):
   Input: (3, 32, 32)
-  Conv1: 64  ch, 3×3, same → pool 2×2 → (64, 16, 16)
-  Conv2: 128 ch, 3×3, same → pool 2×2 → (128, 8, 8)
-  Conv3: 256 ch, 3×3, same → pool 2×2 → (256, 4, 4)
-  Conv4: 512 ch, 3×3, same → pool 2×2 → (512, 2, 2)
+  Conv1: 128 ch, 3×3, SAME  → pool 2×2 → (128, 16, 16)
+  Conv2: 256 ch, 3×3, SAME  → pool 2×2 → (256,  8,  8)
+  Conv3: 512 ch, 3×3, SAME  → pool 2×2 → (512,  4,  4)
+  Conv4: 512 ch, 3×3, VALID → pool 2×2 → (512,  1,  1)
   FC:    512 nodes  (only when USE_FC=True)
   Out:   10 binary nodes
 
@@ -57,7 +57,14 @@ def build_network(seed):
                       tonic_volatility_vol=TONIC_VOL_VOL,
                       add_constant_input=True,
                       volatility_parent=False)
-    for out_ch in [512, 256, 128, 64]:
+    # Last conv (closest to FC head): VALID padding → 4×4 → 2×2 → pool → 1×1
+    net.add_conv_layer(out_channels=512,
+                       kernel_size=3,
+                       padding="VALID",
+                       pool=True,
+                       tonic_volatility=TONIC_VOL,
+                       tonic_volatility_vol=TONIC_VOL_VOL)
+    for out_ch in [512, 256, 128]:
         net.add_conv_layer(out_channels=out_ch,
                            kernel_size=3,
                            pool=True,
