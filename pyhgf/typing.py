@@ -5,7 +5,10 @@ from typing import Callable, NamedTuple, Optional, Union
 
 import jax.numpy as jnp
 from jax import Array
-from jaxlib.xla_extension import PjitFunction
+try:
+    from jaxlib.xla_extension import PjitFunction
+except ImportError:
+    from typing import Callable as PjitFunction
 
 
 class AdjacencyLists(NamedTuple):
