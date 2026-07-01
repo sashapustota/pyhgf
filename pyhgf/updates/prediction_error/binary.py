@@ -20,12 +20,15 @@ def binary_state_node_prediction_error(
         The attributes of the probabilistic nodes.
     node_idx :
         Pointer to the binary state node.
+    edges :
+        The edges of the probabilistic nodes as a tuple of
+        :py:class:`pyhgf.typing.AdjacencyLists`. For each node, the entry lists its
+        value/volatility parents and children.
 
     Returns
     -------
     attributes :
         The attributes of the probabilistic nodes.
-
     """
     # compute the prediction error of the binary state node
     value_prediction_error = (
@@ -77,9 +80,8 @@ def binary_finite_state_node_prediction_error(
     References
     ----------
     .. [1] Weber, L. A., Waade, P. T., Legrand, N., Møller, A. H., Stephan, K. E., &
-       Mathys, C. (2023). The generalized Hierarchical Gaussian Filter (Version 1).
-       arXiv. https://doi.org/10.48550/ARXIV.2305.10937
-
+       Mathys, C. (2026). The generalized hierarchical Gaussian filter.
+       doi:10.7554/elife.110174.1
     """
     value_child_idx = edges[node_idx].value_children[0]  # type: ignore
 

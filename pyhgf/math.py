@@ -3,7 +3,7 @@
 from typing import Union
 
 import jax.numpy as jnp
-from jax import Array
+from jax import Array, custom_jvp
 from jax.nn import sigmoid
 from jax.scipy.special import digamma, gamma, gammaln
 from jax.typing import ArrayLike
@@ -15,7 +15,6 @@ class MultivariateNormal:
     References
     ----------
     .. [1] https://en.wikipedia.org/wiki/Exponential_family
-
     """
 
     @staticmethod
@@ -40,7 +39,6 @@ class MultivariateNormal:
         -------
         xis :
             The sufficient statistics.
-
         """
         return jnp.append(
             mean,
@@ -69,7 +67,6 @@ class MultivariateNormal:
         -------
         means, covariance :
             The parameters of the distribution (mean and covariance).
-
         """
         mean = xis[:dimension]
         covariance = jnp.zeros((dimension, dimension))
@@ -87,7 +84,6 @@ class Normal:
     References
     ----------
     .. [1] https://en.wikipedia.org/wiki/Exponential_family
-
     """
 
     @staticmethod
@@ -112,7 +108,6 @@ class Normal:
         -------
         xis :
             The sufficient statistics.
-
         """
         return jnp.array([mean, mean**2 + variance])
 
@@ -134,7 +129,6 @@ class Normal:
         -------
         mean, variance :
             The parameters of the distribution (mean and variance).
-
         """
         mean = xis[0]
         variance = xis[1] - (mean**2)
@@ -181,7 +175,6 @@ def gaussian_predictive_distribution(
        statistic time series for active inference. In Communications in Computer and
        Information Science. Active Inference (pp. 52–58).
        doi:10.1007/978-3-030-64919-7_7
-
     """
     return (
         jnp.sqrt(1 / (jnp.pi * (nu + 1) * (xi[1] - xi[0] ** 2)))
@@ -194,7 +187,22 @@ def gaussian_predictive_distribution(
 
 
 def gaussian_density(x: ArrayLike, mean: ArrayLike, precision: ArrayLike) -> Array:
-    """Gaussian density as defined by mean and precision."""
+    """Gaussian density as defined by mean and precision.
+
+    Parameters
+    ----------
+    x :
+        The point(s) at which the density is evaluated.
+    mean :
+        The mean of the Gaussian distribution.
+    precision :
+        The precision (inverse variance) of the Gaussian distribution.
+
+    Returns
+    -------
+    density :
+        The Gaussian density evaluated at `x`.
+    """
     return precision / jnp.sqrt(2 * jnp.pi) * jnp.exp(-precision / 2 * (x - mean) ** 2)
 
 
@@ -236,7 +244,6 @@ def binary_surprise(
     >>> from pyhgf.binary import binary_surprise
     >>> binary_surprise(x=1.0, expected_mean=0.7)
     `Array(0.35667497, dtype=float32, weak_type=True)`
-
     """
     if clipping:
         expected_mean = jnp.clip(expected_mean, 1e-6, 1 - 1e-6)
@@ -282,7 +289,6 @@ def gaussian_surprise(
     >>> from pyhgf.math import gaussian_surprise
     >>> gaussian_surprise(x=2.0, expected_mean=0.0, expected_precision=1.0)
     `Array(2.9189386, dtype=float32, weak_type=True)`
-
     """
     return jnp.array(0.5) * (
         jnp.log(jnp.array(2.0) * jnp.pi)
@@ -361,7 +367,6 @@ def binary_surprise_finite_precision(
     -------
     surprise :
         The binary surprise under finite precision.
-
     """
     return -jnp.log(
         expected_mean * gaussian_density(value, eta1, expected_precision)
@@ -370,12 +375,40 @@ def binary_surprise_finite_precision(
 
 
 def sigmoid_inverse_temperature(x: ArrayLike, temperature: ArrayLike) -> Array:
-    """Compute the sigmoid response function with inverse temperature parameter."""
+    """Compute the sigmoid response function with inverse temperature parameter.
+
+    Parameters
+    ----------
+    x :
+        The input value(s), expected in the unit interval.
+    temperature :
+        The inverse temperature controlling the steepness of the sigmoid.
+
+    Returns
+    -------
+    response :
+        The transformed value(s).
+    """
     return (x**temperature) / (x**temperature + (1 - x) ** temperature)
 
 
 def parametrised_sigmoid(x: ArrayLike, theta: ArrayLike, phi: ArrayLike) -> Array:
-    r"""Compute the sigmoid parametrised by :math:`\phi` and :math:`\theta`."""
+    r"""Compute the sigmoid parametrised by :math:`\phi` and :math:`\theta`.
+
+    Parameters
+    ----------
+    x :
+        The point(s) at which the sigmoid is evaluated.
+    theta :
+        The location (inflexion point) :math:`\theta` of the sigmoid.
+    phi :
+        The slope :math:`\phi` of the sigmoid.
+
+    Returns
+    -------
+    value :
+        The sigmoid evaluated at `x`.
+    """
     return sigmoid(phi * (x - theta))
 
 
@@ -386,17 +419,64 @@ def smoothed_rectangular(
     theta_r: ArrayLike = 0.0,
     phi_r: ArrayLike = 1.0,
 ):
-    """Compute the smoothed rectangular weighting function :math:`b`."""
+    r"""Compute the smoothed rectangular weighting function :math:`b`.
+
+    The function is the product of a rising and a falling
+    :py:func:`parametrised_sigmoid`, producing a smooth rectangular window.
+
+    Parameters
+    ----------
+    x :
+        The point(s) at which the function is evaluated.
+    theta_l :
+        The location :math:`\theta` of the rising (left) sigmoid.
+    phi_l :
+        The slope :math:`\phi` of the rising (left) sigmoid.
+    theta_r :
+        The location :math:`\theta` of the falling (right) sigmoid.
+    phi_r :
+        The slope :math:`\phi` of the falling (right) sigmoid.
+
+    Returns
+    -------
+    value :
+        The smoothed rectangular weighting evaluated at `x`.
+    """
     return parametrised_sigmoid(x, theta_l, phi_l) * (
         1 - parametrised_sigmoid(x, theta_r, phi_r)
     )
 
 
+@custom_jvp
 def lambert_w0(z: ArrayLike) -> Array:
-    """Principal branch of the Lambert W function for z >= 0.
+    r"""Principal branch of the Lambert W function for z >= 0.
 
     Solves ``w * exp(w) = z`` via 6 Halley iterations, which yields machine
     precision for all z >= 0.
+
+    A custom JVP is attached so that reverse-mode autodiff does not backprop
+    through the Halley iterations. The implicit relation ``w * exp(w) = z``
+    yields the closed-form derivative
+
+    .. math::
+
+        \frac{\partial W}{\partial z} = \frac{1}{e^{w}\,(1 + w)},
+
+    which is well-defined for all ``z >= 0`` (in particular at ``z = 0``,
+    where ``w = 0`` gives ``∂W/∂z = 1``). This avoids the NaN gradients that
+    would otherwise arise when the Halley iterations' intermediate ``exp(w)``
+    values overflow.
+
+    Parameters
+    ----------
+    z :
+        The argument(s) of the Lambert W function, expected to be ``>= 0``.
+
+    Returns
+    -------
+    w :
+        The principal branch :math:`W_0(z)` solving ``w * exp(w) = z``.
+
     """
     w = jnp.log(z + 1.0)
     for _ in range(6):
@@ -406,3 +486,13 @@ def lambert_w0(z: ArrayLike) -> Array:
         f2 = (w + 2.0) * ew
         w = w - (2.0 * f * f1) / (2.0 * f1**2 - f * f2)
     return w
+
+
+@lambert_w0.defjvp
+def _lambert_w0_jvp(primals, tangents):
+    (z,) = primals
+    (z_dot,) = tangents
+    w = lambert_w0(z)
+    # ∂W/∂z = 1 / (exp(w) * (1 + w)); safe at z = 0 (w = 0 → 1).
+    tangent_out = z_dot / (jnp.exp(w) * (1.0 + w))
+    return w, tangent_out

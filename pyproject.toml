@@ -5,7 +5,7 @@ authors = [
     { name = "Nicolas Legrand", email = "nicolas.legrand@cas.au.dk" }
 ]
 license = "GPL-3.0"
-requires-python = ">=3.10,<=3.13"
+requires-python = ">=3.12"
 readme = "README.md"
 keywords = ["reinforcement learning", "predictive coding", "neural networks", "graphs", "variational inference", "active inference", "causal inference"]
 classifiers = [
@@ -18,11 +18,13 @@ dependencies = [
     "numpy>=2.0.0",
     "matplotlib>=3.4.0",
     "seaborn>=0.13.2",
-    "arviz>=0.21.0,<1.0.0",
-    "pymc>=5.25.1",
-    "jax>=0.4.26",
-    "jaxlib>=0.4.26",
+    "arviz>=1.0.0",
+    "pymc>=6.0.0",
+    "jax>=0.4.26,<0.4.32",
+    "jaxlib>=0.4.26,<0.4.32",
     "graphviz>=0.20.3",
+    "equinox>=0.11.10",
+    "optax>=0.2.5",
 ]
 
 [project.urls]
@@ -60,10 +62,11 @@ dev-dependencies = [
     "sphinx-proof>=0.2.1",
     "sphinxcontrib-mermaid>=1.0.0",
     "treescope>=0.1.9",
+    "bokeh>=3.4.0",
     "nbconvert>=7.16.6",
     "jupyterlab_myst>=2.4.2",
     "pre-commit>=4.3.0",
-    "ruff>=0.14.7"
+    "ruff>=0.14.7",
 ]
 
 [build-system]
@@ -90,6 +93,7 @@ extend-include = ["*.ipynb"]
 [tool.ruff.lint]
 select = ["D", "I"]
 ignore = ["D100", "D104"]
+extend-select = ["D301"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
@@ -97,3 +101,4 @@ convention = "numpy"
 [tool.ruff.format]
 # Ensure the formatter is on (replaces Black)
 preview = true
+docstring-code-line-length = 88

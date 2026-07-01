@@ -14,6 +14,7 @@ Output: conv/results/conv_hgf_cifar.csv
 import csv, os, sys
 import numpy as np
 import jax, jax.numpy as jnp
+import optax
 
 ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data", "cifar10")
@@ -22,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_utils_cifar import load_cifar10, augment
 from pyhgf.model import DeepNetwork
+from pyhgf.utils.vectorized_belief_propagation import prediction_pass
 
 RESULTS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 _tag = ("fc" if os.environ.get("USE_FC", "1") != "0" else "nofc") + "_adam_gelu"
@@ -30,8 +32,12 @@ RESULTS_PATH = os.path.join(RESULTS_DIR, f"conv_hgf_cifar_{_tag}.csv")
 TONIC_VOL     = -10.0
 TONIC_VOL_VOL = -10.0
 ADAM_LR       = 2.641e-4   # matches PCX W_LR from VGG5_PCN_CE.yaml
-BATCH_SIZE    = 32
 LEARNING_KIND = "standard"
+# time_step=1.0 matches the old architecture's implicit (hardcoded) behavior,
+# which TONIC_VOL was tuned against. pyhgf 0.3.0's Session 3 finding that
+# time_step=0.01 stabilises FC-HGF is worth trying here too, but that's a
+# follow-up retuning experiment, not part of this port.
+TIME_STEP     = 1.0
 EPOCHS        = 50
 SEED          = 0
 USE_FC        = os.environ.get("USE_FC", "1") != "0"  # override: USE_FC=0 python ...
@@ -69,32 +75,33 @@ def build_network(seed):
                            tonic_volatility=TONIC_VOL,
                            tonic_volatility_vol=TONIC_VOL_VOL)
     net.add_spatial_input(C=3, H=32, W=32)
-    net.weight_initialisation(strategy="he", seed=seed)
+    net.weight_initialisation("he", key=jax.random.key(seed))
     return net
 
 _X_te_jax = jnp.array(X_te)
-_eval_jit  = {}
+# prediction_pass is a top-level @eqx.filter_jit function keyed on Network's
+# PyTree structure (not on the DeepNetwork instance), so a single module-level
+# jit(vmap(...)) compiles once and is reused across every epoch's evaluate()
+# call, same intent as the old per-instance caching without needing it.
+_eval_jit = jax.jit(jax.vmap(prediction_pass, in_axes=(None, 0)))
 
 def evaluate(net):
-    key = id(net)
-    if key not in _eval_jit:
-        if net._prediction_fn is None:
-            net._prediction_fn = net._create_prediction_fn()
-        pf = net._prediction_fn
-        _eval_jit[key] = jax.jit(
-            lambda state, x: jax.vmap(lambda xi: pf(state, xi))(x)
-        )
-    preds = np.array(_eval_jit[key](net.state, _X_te_jax))
+    preds = np.array(_eval_jit(net.state, _X_te_jax))
     return 100.0 * (np.argmax(preds, axis=1) == y_te).mean()
 
-ADAM_PARAMS = {"lr": ADAM_LR}
-
 # ── JIT warm-up ───────────────────────────────────────────────────────────────
-print(f"Adam LR={ADAM_LR}  batch={BATCH_SIZE}  use_fc={USE_FC}", flush=True)
+# fit() compares the optimizer by identity (`self._optimizer is not optimizer`)
+# to decide whether to reinit opt_state, so a single optax.adam(...) instance
+# must be reused across every fit() call for the same network — a fresh
+# optax.adam(ADAM_LR) each call would silently reset Adam's momentum/variance
+# every epoch.
+OPTIMIZER = optax.adam(ADAM_LR)
+
+print(f"Adam LR={ADAM_LR}  time_step={TIME_STEP}  use_fc={USE_FC}", flush=True)
 print("JIT warm-up...", flush=True)
 _net = build_network(seed=0)
-_net.fit(X_tr[:4], Y_tr[:4], lr="adam", learning_kind=LEARNING_KIND,
-         params=ADAM_PARAMS, batch_size=BATCH_SIZE)
+_net.fit(X_tr[:4], Y_tr[:4], optimizer=OPTIMIZER,
+         learning_kind=LEARNING_KIND, time_step=TIME_STEP)
 print("Done.\n", flush=True)
 
 # ── Train ─────────────────────────────────────────────────────────────────────
@@ -115,8 +122,8 @@ with open(RESULTS_PATH, "a", newline="") as f:
 for epoch in range(1, EPOCHS + 1):
     idx = rng.permutation(len(X_tr))
     X_aug = augment(X_tr[idx], rng)
-    net.fit(X_aug, Y_tr[idx], lr="adam", learning_kind=LEARNING_KIND,
-            params=ADAM_PARAMS, batch_size=BATCH_SIZE)
+    net.fit(X_aug, Y_tr[idx], optimizer=OPTIMIZER,
+            learning_kind=LEARNING_KIND, time_step=TIME_STEP)
     acc = evaluate(net)
     print(f"Epoch {epoch:>2}/{EPOCHS}  acc={acc:.2f}%", flush=True)
     with open(RESULTS_PATH, "a", newline="") as f:

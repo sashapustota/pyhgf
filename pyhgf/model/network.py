@@ -50,6 +50,17 @@ class Network:
     This is the core class to define and manipulate neural networks, that consists in
     1. attributes, 2. structure and 3. update sequences.
 
+    Parameters
+    ----------
+    volatility_updates :
+        The type of update to perform for volatility coupling. Can be ``"unbounded"``
+        (default), ``"eHGF"`` or ``"standard"``.
+    max_posterior_precision :
+        Upper bound applied to every posterior precision write. Defaults to ``1e10``.
+    mean_field_updates :
+        If ``False`` (default), use the relaxed prediction and posterior updates. If
+        ``True``, use the original mean-field updates.
+
     Attributes
     ----------
     attributes :
@@ -69,17 +80,22 @@ class Network:
     scan_fn :
         The function that is passed to :py:func:`jax.lax.scan`. This is a pre-
         parametrized version of :py:func:`pyhgf.networks.beliefs_propagation`.
-
     """
 
-    def __init__(self, update_type: str = "eHGF") -> None:
-        """Initialize an empty neural network.
+    def __init__(
+        self,
+        volatility_updates: str = "unbounded",
+        max_posterior_precision: float = 1e10,
+        mean_field_updates: bool = False,
+        precision_clipping_value: float = 1e-6,
+    ) -> None:
+        r"""Initialize an empty neural network.
 
         Parameters
         ----------
-        update_type :
-            The type of update to perform for volatility coupling. Can be `"eHGF"`
-            (defaults), `"unbounded"` or `"standard"`. The unbounded approximation was
+        volatility_updates :
+            The type of update to perform for volatility coupling. Can be `"unbounded"`
+            (defaults), `"eHGF"` or `"standard"`. The unbounded approximation was
             recently introduced to avoid negative precisions updates, which greatly
             improve sampling performance. The eHGF update step was proposed as an
             alternative to the original definition in that it starts by updating the
@@ -89,13 +105,43 @@ class Network:
             .. note:
               The different update steps only apply to nodes having at least one
               volatility parents. In other cases, the regular HGF updates are applied.
+        max_posterior_precision :
+            Upper bound applied to every posterior precision write (value level for
+            continuous/volatile nodes and the implicit volatility level for volatile
+            nodes). Defaults to ``1e10`` and is shared with the vectorized JAX and Rust
+            backends. Increase it to relax the cap, or lower it to be more conservative
+            against precision blow-up.
+        mean_field_updates :
+            If ``False`` (default), use the relaxed prediction and posterior updates,
+            which lift the mean-field assumption on value-coupling edges via
+            Schur-complement and Laplace/MGF corrections. If ``True``, use the original
+            mean-field updates from [1]_.
+        precision_clipping_value :
+            Binary state nodes clip their predicted mean to
+            ``[precision_clipping_value, 1 - precision_clipping_value]`` so the implied
+            binary precision :math:`\hat{\mu}(1 - \hat{\mu})` never collapses to zero. A
+            larger value (e.g. ``1e-3``, matching the TAPAS HGF Toolbox) keeps the
+            forward filter stable in high-volatility regimes; a very small value
+            (default ``1e-6``) keeps the bound from creating flat, zero-gradient
+            plateaus that hurt gradient-based inference (HMC/NUTS, optimisation). Shared
+            with the vectorized JAX and Rust backends.
 
+        References
+        ----------
+        .. [1] Weber, L. A., Waade, P. T., Legrand, N., Møller, A. H., Stephan, K. E., &
+          Mathys, C. (2026). The generalized hierarchical Gaussian filter.
+          doi:10.7554/elife.110174.1
         """
         self.edges: Edges = ()
         self.n_nodes: int = 0  # number of nodes in the network
         self.node_trajectories: dict = {}
         self.predictions: dict = {}
-        self.attributes: Attributes = {-1: {"time_step": 0.0}}
+        self.attributes: Attributes = {
+            -1: {
+                "time_step": 0.0,
+                "precision_clipping_value": float(precision_clipping_value),
+            }
+        }
         self.update_sequence: Optional[UpdateSequence] = None
         self.scan_fn: Optional[Callable] = None
         self.scan_fn_sample: Optional[Callable] = None
@@ -103,7 +149,10 @@ class Network:
         self.input_dim: list = []
         self.action_steps: Optional[Sequence] = None
         self.last_attributes: Optional[Attributes] = None
-        self.update_type = update_type
+        self.volatility_updates = volatility_updates
+        self.mean_field_updates = mean_field_updates
+        self.max_posterior_precision = float(max_posterior_precision)
+        self.precision_clipping_value = float(precision_clipping_value)
 
     @property
     def input_idxs(self):
@@ -119,6 +168,10 @@ class Network:
             if self.edges[idx].node_type == 2:
                 self.attributes[idx]["autoconnection_strength"] = 0.0
                 self.attributes[idx]["tonic_volatility"] = 0.0
+            # ``observed`` is read by the propagation step on every input node.
+            # Node kinds whose defaults don't declare it (e.g. volatile-state)
+            # default to 1 here so the scan-carry pytree stays consistent.
+            self.attributes[idx].setdefault("observed", 1)
 
         return input_idxs
 
@@ -145,7 +198,6 @@ class Network:
         sampling_fn :
             If `True`, also create a generative sampling function. This is used for
             generative sampling of the network. Defaults to `False`.
-
         """
         # get the dimension of the input nodes
         if not self.input_dim:
@@ -154,7 +206,9 @@ class Network:
         # create the update sequence if it does not already exist
         if self.update_sequence is None:
             self.update_sequence = get_update_sequence(
-                network=self, update_type=self.update_type
+                network=self,
+                volatility_updates=self.volatility_updates,
+                mean_field_updates=self.mean_field_updates,
             )
 
         # create the belief propagation function
@@ -214,7 +268,6 @@ class Network:
             Dictionary of Adam hyper-parameters (used only when ``lr="adam"``):
             ``beta1`` (default 0.9), ``beta2`` (default 0.999), ``epsilon``
             (default 1e-8), and ``lr`` (default 1e-3, the Adam step size).
-
         """
         # get the dimension of the input nodes
         if not self.input_dim:
@@ -223,7 +276,9 @@ class Network:
         # create the update sequence if it does not already exist
         if self.update_sequence is None:
             self.update_sequence = get_update_sequence(
-                network=self, update_type=self.update_type
+                network=self,
+                volatility_updates=self.volatility_updates,
+                mean_field_updates=self.mean_field_updates,
             )
         # create the learning sequence
         # all nodes except the prediction nodes should update their coupling strengths
@@ -361,7 +416,6 @@ class Network:
             usage and speeds up training.
         overwrite :
             If `True`, create a new belief propagation function.
-
         """
         if x.ndim == 1:
             x = x[:, jnp.newaxis]
@@ -431,7 +485,6 @@ class Network:
         predictions :
             An array of shape ``(n_samples, len(inputs_y_idxs))`` containing the
             ``expected_mean`` of each target node at every time step.
-
         """
         if x.ndim == 1:
             x = x[:, jnp.newaxis]
@@ -439,7 +492,9 @@ class Network:
         # ensure the update sequence exists
         if self.update_sequence is None:
             self.update_sequence = get_update_sequence(
-                network=self, update_type=self.update_type
+                network=self,
+                volatility_updates=self.volatility_updates,
+                mean_field_updates=self.mean_field_updates,
             )
 
         # keep only prediction steps that are not on the predictor nodes
@@ -512,7 +567,6 @@ class Network:
             step (accessible via ``self.node_trajectories``).  If False, only
             the final state is kept, which significantly reduces memory usage
             and speeds up training.
-
         """
         if rng_keys is not None:
             # get one key for each time step
@@ -589,8 +643,6 @@ class Network:
             Array of time steps.
         rng_key :
             Random number generator key, by default PRNGKey(0).
-
-
         """
         self.samples = sample(
             self, time_steps=time_steps, n_predictions=n_predictions, rng_key=rng_key
@@ -649,7 +701,6 @@ class Network:
         rng_keys :
             Optional. A random key for the random number generator. This is only used
             when an action function is provided.
-
         """
         if rng_keys is not None:
             # get one key for each time step
@@ -793,7 +844,6 @@ class Network:
         **kwargs :
             Additional keyword parameters will be passed and overwrite the node
             attributes.
-
         """
         if kind not in [
             "dp-state",
@@ -930,7 +980,6 @@ class Network:
         structure_df :
             Pandas data frame with the time series of sufficient statistics and
             the surprise of each node in the structure.
-
         """
         return to_pandas(self)
 
@@ -965,7 +1014,6 @@ class Network:
         -------
         surprise :
             The model's surprise given the input data and the response function.
-
         """
         return response_function(
             hgf=self,
@@ -1002,7 +1050,6 @@ class Network:
             functions, a coupling function should be indicated for all the parent nodes.
             If no coupling function is stated, the relationship between nodes is assumed
             linear.
-
         """
         attributes, edges = add_edges(
             attributes=self.attributes,

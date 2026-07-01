@@ -8,6 +8,7 @@ Output: conv/results/baseline_fc_hgf_mnist.csv
 import csv, os, sys
 import numpy as np
 import jax, jax.numpy as jnp
+import optax
 
 ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data", "mnist")
@@ -53,17 +54,21 @@ def build_network(seed):
                   add_constant_input=False,
                   coupling_fn=linear,
                   volatility_parent=False)
-    net.weight_initialisation(strategy="he", seed=seed)
+    net.weight_initialisation("he", key=jax.random.key(seed))
     return net
 
 def evaluate(net):
     preds = np.array(net.predict(jnp.array(X_te)))
     return 100.0 * (np.argmax(preds, axis=1) == y_te).mean()
 
+# fit() compares the optimizer by identity to decide whether to reinit
+# opt_state, so the same instance must be reused across every fit() call.
+OPTIMIZER = optax.sgd(LR)
+
 # ── JIT warm-up ────────────────────────────────────────────────────────────────
 print("JIT warm-up...", flush=True)
 _net = build_network(seed=0)
-_net.fit(X_tr[:4], Y_tr[:4], lr=LR, learning_kind="precision_weighted")
+_net.fit(X_tr[:4], Y_tr[:4], optimizer=OPTIMIZER, learning_kind="precision_weighted")
 print("Done.\n", flush=True)
 
 # ── Train ──────────────────────────────────────────────────────────────────────
@@ -77,7 +82,7 @@ net = build_network(SEED)
 
 for epoch in range(1, EPOCHS + 1):
     idx = rng.permutation(len(X_tr))
-    net.fit(X_tr[idx], Y_tr[idx], lr=LR, learning_kind="precision_weighted")
+    net.fit(X_tr[idx], Y_tr[idx], optimizer=OPTIMIZER, learning_kind="precision_weighted")
     acc = evaluate(net)
     print(f"Epoch {epoch:>2}/{EPOCHS}  acc={acc:.2f}%", flush=True)
     with open(RESULTS_PATH, "a", newline="") as f:

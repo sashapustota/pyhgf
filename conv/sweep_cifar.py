@@ -6,7 +6,8 @@ Results → conv/results/sweep_cifar.csv
 """
 import csv, os, sys, itertools
 import numpy as np
-import jax.numpy as jnp
+import jax, jax.numpy as jnp
+import optax
 
 ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data", "cifar10")
@@ -49,7 +50,7 @@ def build_network(seed):
         net.add_conv_layer(out_channels=out_ch, kernel_size=3, pool=True,
                            tonic_volatility=TONIC_VOL, tonic_volatility_vol=TONIC_VOL)
     net.add_spatial_input(C=3, H=32, W=32)
-    net.weight_initialisation(strategy="he", seed=seed)
+    net.weight_initialisation("he", key=jax.random.key(seed))
     return net
 
 def evaluate(net):
@@ -60,7 +61,7 @@ def evaluate(net):
 print("JIT warm-up...", flush=True)
 for kind in KINDS:
     _net = build_network(0)
-    _net.fit(X_tr[:4], Y_tr[:4], lr=0.001, learning_kind=kind)
+    _net.fit(X_tr[:4], Y_tr[:4], optimizer=optax.sgd(0.001), learning_kind=kind)
     print(f"  warmed up: {kind}", flush=True)
 print("Done.\n", flush=True)
 
@@ -78,11 +79,14 @@ best = {}  # (lr, kind) → best acc
 for combo_i, (lr, kind) in enumerate(combos, 1):
     print(f"[{combo_i:>2}/{len(combos)}]  lr={lr:<7}  kind={kind}", flush=True)
     net = build_network(SEED)
+    # fit() compares the optimizer by identity to decide whether to reinit
+    # opt_state, so it must be built once per combo and reused across epochs.
+    optimizer = optax.sgd(lr)
     sweep_rng = np.random.default_rng(SEED)
     combo_best = 0.0
     for epoch in range(1, EPOCHS + 1):
         perm = sweep_rng.permutation(N_TRAIN)
-        net.fit(X_tr[perm], Y_tr[perm], lr=lr, learning_kind=kind)
+        net.fit(X_tr[perm], Y_tr[perm], optimizer=optimizer, learning_kind=kind)
         acc = evaluate(net)
         combo_best = max(combo_best, acc)
         print(f"  epoch {epoch:>2}/{EPOCHS}  acc={acc:5.2f}%", flush=True)

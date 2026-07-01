@@ -21,7 +21,8 @@ Chance = 25%.  If 4-conv fails while 2-conv passes, gradient depth is the issue.
 """
 import os, sys
 import numpy as np
-import jax.numpy as jnp
+import jax, jax.numpy as jnp
+import optax
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -75,7 +76,7 @@ def build_2conv(seed):
         net.add_conv_layer(out_channels=out_ch, kernel_size=3, pool=True,
                            tonic_volatility=TONIC_VOL, tonic_volatility_vol=TONIC_VOL)
     net.add_spatial_input(C=1, H=16, W=16)
-    net.weight_initialisation(strategy="he", seed=seed)
+    net.weight_initialisation("he", key=jax.random.key(seed))
     return net
 
 def build_4conv(seed):
@@ -90,20 +91,26 @@ def build_4conv(seed):
         net.add_conv_layer(out_channels=out_ch, kernel_size=3, pool=True,
                            tonic_volatility=TONIC_VOL, tonic_volatility_vol=TONIC_VOL)
     net.add_spatial_input(C=1, H=32, W=32)
-    net.weight_initialisation(strategy="he", seed=seed)
+    net.weight_initialisation("he", key=jax.random.key(seed))
     return net
 
 def evaluate(net, X, y):
     preds = np.array(net.predict(jnp.array(X)))
     return 100.0 * (np.argmax(preds, axis=1) == y).mean()
 
+# fit() compares the optimizer by identity to decide whether to reinit
+# opt_state, so the same instance must be reused across every fit() call for
+# a given network. Sharing one instance across networks is safe (each
+# DeepNetwork tracks its own opt_state independently).
+OPTIMIZER = optax.sgd(LR)
+
 # ── JIT warm-up ────────────────────────────────────────────────────────────────
 print("JIT warm-up (2-conv)...", flush=True)
 _net = build_2conv(seed=0)
-_net.fit(X_tr[:2], Y_tr[:2], lr=LR, learning_kind="precision_weighted")
+_net.fit(X_tr[:2], Y_tr[:2], optimizer=OPTIMIZER, learning_kind="precision_weighted")
 print("JIT warm-up (4-conv)...", flush=True)
 _net4 = build_4conv(seed=0)
-_net4.fit(X_tr32[:2], Y_tr[:2], lr=LR, learning_kind="precision_weighted")
+_net4.fit(X_tr32[:2], Y_tr[:2], optimizer=OPTIMIZER, learning_kind="precision_weighted")
 print("Done.\n", flush=True)
 
 # ── 2-conv run ─────────────────────────────────────────────────────────────────
@@ -112,7 +119,7 @@ net2 = build_2conv(SEED)
 rng2 = np.random.default_rng(SEED)
 for epoch in range(1, EPOCHS + 1):
     idx = rng2.permutation(N_TRAIN)
-    net2.fit(X_tr[idx], Y_tr[idx], lr=LR, learning_kind="precision_weighted")
+    net2.fit(X_tr[idx], Y_tr[idx], optimizer=OPTIMIZER, learning_kind="precision_weighted")
     acc = evaluate(net2, X_te, y_te)
     print(f"  Epoch {epoch:>2}/{EPOCHS}  acc={acc:5.1f}%  {'#' * int(acc / 5)}", flush=True)
 
@@ -122,7 +129,7 @@ net4 = build_4conv(SEED)
 rng4 = np.random.default_rng(SEED)
 for epoch in range(1, EPOCHS + 1):
     idx = rng4.permutation(N_TRAIN)
-    net4.fit(X_tr32[idx], Y_tr[idx], lr=LR, learning_kind="precision_weighted")
+    net4.fit(X_tr32[idx], Y_tr[idx], optimizer=OPTIMIZER, learning_kind="precision_weighted")
     acc = evaluate(net4, X_te32, y_te)
     print(f"  Epoch {epoch:>2}/{EPOCHS}  acc={acc:5.1f}%  {'#' * int(acc / 5)}", flush=True)
 

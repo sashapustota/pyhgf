@@ -5,371 +5,783 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Union
+import dataclasses
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jax.nn import sigmoid
+import optax
 
-from pyhgf.typing import NetworkState
+from pyhgf.typing.vectorised import Layer, LayerStack, Network
 from pyhgf.updates.vectorized.binary import (
     vectorized_binary_prediction,
     vectorized_binary_prediction_error,
 )
-from pyhgf.updates.vectorized.conv_learning import (
-    _apply_conv_gradient,
-    _compute_conv_gradient,
-    vectorized_conv_weight_update,
-)
+from pyhgf.updates.vectorized.conv_learning import vectorized_conv_weight_gradient
 from pyhgf.updates.vectorized.conv_prediction import (
     vectorized_conv_parent_posterior_from_conv,
     vectorized_conv_parent_posterior_from_fc,
     vectorized_conv_prediction,
 )
-from pyhgf.updates.vectorized.learning import (
-    _apply_fc_gradient,
-    _compute_fc_gradient,
-    vectorized_weight_update,
-)
+from pyhgf.updates.vectorized.learning import vectorized_weight_gradient
 from pyhgf.updates.vectorized.volatile import (
     vectorized_layer_posterior_update,
     vectorized_layer_prediction,
     vectorized_layer_prediction_error,
 )
 
+# ---------------------------------------------------------------------------
+# Element-shape helpers
+# ---------------------------------------------------------------------------
+
+
+def _bottom_slice(stack: LayerStack):
+    """Return ``(state, params, weights_in)`` of the *bottommost* stack slice."""
+    state = jax.tree_util.tree_map(lambda x: x[0], stack.state)
+    params = jax.tree_util.tree_map(lambda x: x[0], stack.params)
+    return state, params, stack.weights_in[0]
+
+
+def _top_slice(stack: LayerStack):
+    """Return ``(state, params, weights_in)`` of the *topmost* stack slice."""
+    state = jax.tree_util.tree_map(lambda x: x[-1], stack.state)
+    params = jax.tree_util.tree_map(lambda x: x[-1], stack.params)
+    return state, params, stack.weights_in[-1]
+
+
+def _parent_view(elem):
+    """Treat a ``Layer`` or ``LayerStack`` uniformly when acting as a parent.
+
+    Returns ``(state, weights_in, coupling_fn, add_constant_input, conv_spec)``. The
+    five pieces ``propagation_step`` needs to predict a child below. ``conv_spec`` is
+    ``None`` unless the child being predicted is a conv layer (a ``LayerStack`` is
+    never conv, so it always reports ``None``).
+
+    For a ``LayerStack``, the parent is the *bottommost* slice (the slice closest to the
+    child below the stack).
+    """
+    if isinstance(elem, LayerStack):
+        state, _, weights = _bottom_slice(elem)
+        return state, weights, elem.coupling_fn, elem.add_constant_input, None
+    return (
+        elem.state,
+        elem.weights_in,
+        elem.coupling_fn,
+        elem.add_constant_input,
+        elem.conv_spec,
+    )
+
+
+def _child_view(elem):
+    """Treat a ``Layer`` or ``LayerStack`` uniformly when acting as a child.
+
+    Returns ``(state, kind, is_input_layer)``. What's needed when something above is
+    doing a posterior update or computing PE-driven weight grads using this element's
+    state as the child.
+
+    For a ``LayerStack``, the child role is filled by the *topmost* slice (the slice
+    closest to the parent above the stack).
+    """
+    if isinstance(elem, LayerStack):
+        state, _, _ = _top_slice(elem)
+        return state, elem.kind, False  # interior; never an input layer
+    return elem.state, elem.kind, elem.is_input_layer
+
+
+# ---------------------------------------------------------------------------
+# Top-down prediction
+# ---------------------------------------------------------------------------
+
+
+def _predict_layer_from_parent(
+    child: Layer,
+    parent_state,
+    parent_weights,
+    parent_coupling_fn,
+    parent_has_constant: bool,
+    *,
+    time_step: float,
+    precision_clipping_value: float,
+    parent_conv_spec=None,
+):
+    """Predict a single ``Layer`` child from a parent view."""
+    if child.kind == "conv":
+        kernel, bias = parent_weights
+        stride, padding, pool, pool_size, pool_stride = parent_conv_spec
+        new_state = vectorized_conv_prediction(
+            child_state=child.state,
+            parent_state=parent_state,
+            kernel=kernel,
+            bias=bias,
+            params=child.params,
+            time_step=time_step,
+            coupling_fn=parent_coupling_fn,
+            stride=stride,
+            padding=padding,
+            pool=pool,
+            pool_size=pool_size,
+            pool_stride=pool_stride,
+        )
+    elif child.kind == "binary":
+        new_state = vectorized_binary_prediction(
+            child_state=child.state,
+            parent_state=parent_state,
+            weights=parent_weights,
+            coupling_fn=parent_coupling_fn,
+            parent_has_constant=parent_has_constant,
+            precision_clipping_value=precision_clipping_value,
+        )
+    else:
+        new_state = vectorized_layer_prediction(
+            child_state=child.state,
+            parent_state=parent_state,
+            weights=parent_weights,
+            params=child.params,
+            time_step=time_step,
+            coupling_fn=parent_coupling_fn,
+            parent_has_constant=parent_has_constant,
+            has_volatility_parent=child.has_volatility_parent,
+            is_input_layer=child.is_input_layer,
+        )
+    return dataclasses.replace(child, state=new_state)
+
+
+def _predict_stack_from_parent(
+    stack: LayerStack,
+    parent_state,
+    parent_weights,
+    parent_coupling_fn,
+    parent_has_constant: bool,
+    *,
+    time_step: float,
+):
+    """Top-down sweep over a ``LayerStack``.
+
+    Step 1 (boundary): predict the topmost slice from the external parent. Using the
+    parent's coupling/weights/bias (which may differ from the stack's. For ``(L, S)``
+    they're the layer's; for ``(S, S)`` they're the parent stack's bottommost slice).
+
+    Step 2 (scan): predict slice ``k`` from slice ``k+1`` for ``k = N-2 ... 0``
+    using ``stack.weights_in[k+1]`` and the stack's own coupling_fn / bias.
+    Scan in reverse so the carry threads top-to-bottom through the stack.
+    """
+    top_slice_state, top_slice_params, _ = _top_slice(stack)
+    new_top_state = vectorized_layer_prediction(
+        child_state=top_slice_state,
+        parent_state=parent_state,
+        weights=parent_weights,
+        params=top_slice_params,
+        time_step=time_step,
+        coupling_fn=parent_coupling_fn,
+        parent_has_constant=parent_has_constant,
+        has_volatility_parent=stack.has_volatility_parent,
+        is_input_layer=False,
+    )
+
+    n = stack.n_layers
+    if n == 1:
+        # Degenerate: stack with a single slice. Just write the new state.
+        new_state = jax.tree_util.tree_map(
+            lambda x, v: x.at[0].set(v), stack.state, new_top_state
+        )
+        return dataclasses.replace(stack, state=new_state)
+
+    # xs: per-iteration data for predicting slices N-2 ... 0 from the slice above.
+    # At step k, body(parent_state, xs[k]) → predict slice k. The "parent's
+    # weights" used to predict slice k come from slice k+1 — i.e. stack.weights_in[k+1].
+    xs_child_state = jax.tree_util.tree_map(lambda x: x[: n - 1], stack.state)
+    xs_child_params = jax.tree_util.tree_map(lambda x: x[: n - 1], stack.params)
+    xs_parent_weights = stack.weights_in[1:]  # shape (n-1, ...)
+
+    def body(parent_state_carry, k_data):
+        child_state, child_params, parent_weights_k = k_data
+        new_child_state = vectorized_layer_prediction(
+            child_state=child_state,
+            parent_state=parent_state_carry,
+            weights=parent_weights_k,
+            params=child_params,
+            time_step=time_step,
+            coupling_fn=stack.coupling_fn,
+            parent_has_constant=stack.add_constant_input,
+            has_volatility_parent=stack.has_volatility_parent,
+            is_input_layer=False,
+        )
+        return new_child_state, new_child_state
+
+    _, new_states_below = jax.lax.scan(
+        body,
+        init=new_top_state,
+        xs=(xs_child_state, xs_child_params, xs_parent_weights),
+        reverse=True,
+    )
+
+    # new_states_below has shape (n-1, ...) for slices 0..n-2;
+    # new_top_state is for slice n-1. Concatenate along axis 0.
+    new_full_state = jax.tree_util.tree_map(
+        lambda below, top: jnp.concatenate([below, top[None, ...]], axis=0),
+        new_states_below,
+        new_top_state,
+    )
+    return dataclasses.replace(stack, state=new_full_state)
+
+
+def _topdown_predict(
+    parent_elem, child_elem, *, time_step: float, precision_clipping_value: float = 1e-6
+):
+    """Predict ``child_elem`` from ``parent_elem``.
+
+    Both can be Layer or LayerStack.
+    """
+    (
+        parent_state,
+        parent_weights,
+        parent_coupling_fn,
+        parent_has_const,
+        parent_conv_spec,
+    ) = _parent_view(parent_elem)
+    if isinstance(child_elem, LayerStack):
+        # LayerStacks are continuous/volatile only — the binary clip never applies.
+        return _predict_stack_from_parent(
+            child_elem,
+            parent_state,
+            parent_weights,
+            parent_coupling_fn,
+            parent_has_const,
+            time_step=time_step,
+        )
+    return _predict_layer_from_parent(
+        child_elem,
+        parent_state,
+        parent_weights,
+        parent_coupling_fn,
+        parent_has_const,
+        time_step=time_step,
+        precision_clipping_value=precision_clipping_value,
+        parent_conv_spec=parent_conv_spec,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Leaf PE (bottom element of the network)
+# ---------------------------------------------------------------------------
+
+
+def _leaf_pe(layer: Layer, *, volatility_updates: str, max_posterior_precision: float):
+    """Compute the PE of the bottom layer (a ``Layer``; leaves can't be stacks)."""
+    if layer.kind == "binary":
+        new_state = vectorized_binary_prediction_error(layer=layer.state)
+    else:
+        new_state = vectorized_layer_prediction_error(
+            layer=layer.state,
+            params=layer.params,
+            volatility_updates=volatility_updates,
+            has_volatility_parent=layer.has_volatility_parent,
+            max_posterior_precision=max_posterior_precision,
+        )
+    return dataclasses.replace(layer, state=new_state)
+
+
+# ---------------------------------------------------------------------------
+# Bottom-up posterior + PE
+# ---------------------------------------------------------------------------
+
+
+def _posterior_pe_layer(
+    parent: Layer,
+    child_state,
+    child_is_input_layer: bool,
+    *,
+    volatility_updates: str,
+    max_posterior_precision: float,
+):
+    """Single-layer posterior update + PE."""
+    # A conv kernel/bias tuple on weights_in means the gradient-ascent-step
+    # surrogate posterior is needed (no closed-form Kalman update) — this can
+    # happen on a "conv"-kind parent (conv-to-conv edge) *or* on a plain
+    # "volatile" spatial-input layer sitting directly above a conv child (the
+    # weights_in tuple lives on whichever layer owns that edge, regardless of
+    # its own kind). A non-tuple weights_in on a "conv"-kind parent means the
+    # child below is FC on a near-1x1 collapsed conv output (e.g. after VALID
+    # padding + pooling), connected by a plain dense matrix instead.
+    if isinstance(parent.weights_in, tuple):
+        kernel, bias = parent.weights_in
+        stride, padding, pool, pool_size, pool_stride = parent.conv_spec
+        new_state = vectorized_conv_parent_posterior_from_conv(
+            parent_state=parent.state,
+            child_state=child_state,
+            kernel=kernel,
+            bias=bias,
+            coupling_fn=parent.coupling_fn,
+            stride=stride,
+            padding=padding,
+            pool=pool,
+            pool_size=pool_size,
+            pool_stride=pool_stride,
+        )
+        new_state = vectorized_layer_prediction_error(
+            layer=new_state,
+            params=parent.params,
+            volatility_updates=volatility_updates,
+            has_volatility_parent=parent.has_volatility_parent,
+            max_posterior_precision=max_posterior_precision,
+        )
+        return dataclasses.replace(parent, state=new_state)
+    if parent.kind == "conv":
+        new_state = vectorized_conv_parent_posterior_from_fc(
+            parent_state=parent.state,
+            child_state=child_state,
+            fc_weights=parent.weights_in,
+            coupling_fn=parent.coupling_fn,
+            add_constant_input=parent.add_constant_input,
+        )
+        new_state = vectorized_layer_prediction_error(
+            layer=new_state,
+            params=parent.params,
+            volatility_updates=volatility_updates,
+            has_volatility_parent=parent.has_volatility_parent,
+            max_posterior_precision=max_posterior_precision,
+        )
+        return dataclasses.replace(parent, state=new_state)
+
+    new_state = vectorized_layer_posterior_update(
+        layer=parent.state,
+        child=child_state,
+        weights=parent.weights_in,
+        coupling_fn=parent.coupling_fn,
+        parent_has_constant=parent.add_constant_input,
+        max_posterior_precision=max_posterior_precision,
+        child_is_input_layer=child_is_input_layer,
+    )
+    if parent.kind == "binary":
+        new_state = vectorized_binary_prediction_error(layer=new_state)
+    else:
+        new_state = vectorized_layer_prediction_error(
+            layer=new_state,
+            params=parent.params,
+            volatility_updates=volatility_updates,
+            has_volatility_parent=parent.has_volatility_parent,
+            max_posterior_precision=max_posterior_precision,
+        )
+    return dataclasses.replace(parent, state=new_state)
+
+
+def _posterior_pe_stack(
+    stack: LayerStack,
+    child_state_init,
+    *,
+    volatility_updates: str,
+    max_posterior_precision: float,
+):
+    """Bottom-up sweep over a ``LayerStack`` (posterior update + PE per slice).
+
+    Scan forward from slice 0 (bottommost) to slice N-1 (topmost). The carry is the
+    just-PE'd child state below the current slice; on the first iteration it's the
+    external ``child_state_init``.
+
+    ``child_is_input_layer=False`` throughout — Phase 8 v1 requires the layer below a
+    stack to be non-leaf, so the boundary is interior.
+    """
+
+    def body(child_carry_state, slice_data):
+        slice_state, slice_params, slice_weights = slice_data
+        new_state = vectorized_layer_posterior_update(
+            layer=slice_state,
+            child=child_carry_state,
+            weights=slice_weights,
+            coupling_fn=stack.coupling_fn,
+            parent_has_constant=stack.add_constant_input,
+            max_posterior_precision=max_posterior_precision,
+            child_is_input_layer=False,
+        )
+        new_state = vectorized_layer_prediction_error(
+            layer=new_state,
+            params=slice_params,
+            volatility_updates=volatility_updates,
+            has_volatility_parent=stack.has_volatility_parent,
+            max_posterior_precision=max_posterior_precision,
+        )
+        return new_state, new_state
+
+    _, new_full_state = jax.lax.scan(
+        body,
+        init=child_state_init,
+        xs=(stack.state, stack.params, stack.weights_in),
+    )
+    return dataclasses.replace(stack, state=new_full_state)
+
+
+def _bottomup_posterior_pe(
+    parent_elem,
+    child_elem,
+    *,
+    volatility_updates: str,
+    max_posterior_precision: float,
+):
+    """Posterior update + PE for ``parent_elem`` using ``child_elem`` below."""
+    child_state, _, child_is_input_layer = _child_view(child_elem)
+    if isinstance(parent_elem, LayerStack):
+        return _posterior_pe_stack(
+            parent_elem,
+            child_state,
+            volatility_updates=volatility_updates,
+            max_posterior_precision=max_posterior_precision,
+        )
+    return _posterior_pe_layer(
+        parent_elem,
+        child_state,
+        child_is_input_layer,
+        volatility_updates=volatility_updates,
+        max_posterior_precision=max_posterior_precision,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Weight gradients
+# ---------------------------------------------------------------------------
+
+
+def _grad_layer(parent: Layer, child_elem, learning_kind: str):
+    """Per-Layer weight gradient (same shape as ``parent.weights_in``)."""
+    child_state, child_kind, _ = _child_view(child_elem)
+    if isinstance(parent.weights_in, tuple):
+        # A tuple weights_in means a conv kernel/bias, regardless of the
+        # parent's own kind — a plain "volatile" spatial-input layer sitting
+        # directly above a conv child still owns a kernel/bias tuple here.
+        kernel, bias = parent.weights_in
+        stride, padding, pool, pool_size, pool_stride = parent.conv_spec
+        return vectorized_conv_weight_gradient(
+            parent_state=parent.state,
+            child_state=child_state,
+            kernel=kernel,
+            bias=bias,
+            coupling_fn=parent.coupling_fn,
+            stride=stride,
+            padding=padding,
+            pool=pool,
+            pool_size=pool_size,
+            pool_stride=pool_stride,
+            kind=learning_kind,
+        )
+    # Plain FC weight matrix — including a conv parent whose child below is FC
+    # (e.g. a conv layer collapsed to (C, 1, 1) by VALID padding + pooling,
+    # feeding an FC layer through a dense matrix rather than a real kernel).
+    # The generic gradient already flattens a multi-dim ``parent_state.mean``.
+    return vectorized_weight_gradient(
+        parent_state=parent.state,
+        child_state=child_state,
+        coupling_fn=parent.coupling_fn,
+        kind=learning_kind,
+        parent_has_constant=parent.add_constant_input,
+        child_is_binary=(child_kind == "binary"),
+    )
+
+
+def _grad_stack(stack: LayerStack, child_elem, learning_kind: str):
+    """Per-slice weight gradients for a ``LayerStack``.
+
+    The child of slice 0 is the layer below the stack (``child_elem``); the child of
+    slice k>0 is slice k-1 within the stack. Pre-pend the external child's state to the
+    stack's state along axis 0 to form an ``(N+1, ...)`` array, then ``vmap`` the per-
+    slice grad over the N parent slices and the N child slots.
+    """
+    child_state, _, _ = _child_view(child_elem)
+
+    combined_state = jax.tree_util.tree_map(
+        lambda c, s: jnp.concatenate([c[None, ...], s], axis=0),
+        child_state,
+        stack.state,
+    )
+    # parent_states[k] = stack.state[k]; child_states[k] = combined[k]
+    parent_states = stack.state
+    child_states = jax.tree_util.tree_map(lambda x: x[:-1], combined_state)
+
+    def per_slice(parent_state, child_state_for_slice):
+        return vectorized_weight_gradient(
+            parent_state=parent_state,
+            child_state=child_state_for_slice,
+            coupling_fn=stack.coupling_fn,
+            kind=learning_kind,
+            parent_has_constant=stack.add_constant_input,
+            child_is_binary=False,
+        )
+
+    return jax.vmap(per_slice)(parent_states, child_states)
+
+
+def _weight_grad(parent_elem, child_elem, learning_kind: str):
+    """Weight gradient for ``parent_elem.weights_in``."""
+    if isinstance(parent_elem, LayerStack):
+        return _grad_stack(parent_elem, child_elem, learning_kind)
+    return _grad_layer(parent_elem, child_elem, learning_kind)
+
+
+# ---------------------------------------------------------------------------
+# Element-level state writeback (for clamping x/y at the boundaries)
+# ---------------------------------------------------------------------------
+
+
+def _set_top_predictors(elem, x):
+    """Clamp ``expected_mean`` and ``mean`` of the top element to ``x``.
+
+    The top element must be a ``Layer`` (input layer).
+    """
+    if isinstance(elem, LayerStack):
+        raise NotImplementedError("Top of network must be a Layer, not a LayerStack.")
+    new_state = dataclasses.replace(elem.state, expected_mean=x, mean=x)
+    return dataclasses.replace(elem, state=new_state)
+
+
+def _set_bottom_observations(elem, y):
+    """Clamp ``mean`` of the bottom element to ``y``.
+
+    Must be a ``Layer`` (leaf).
+    """
+    if isinstance(elem, LayerStack):
+        raise NotImplementedError(
+            "Bottom of network must be a Layer, not a LayerStack."
+        )
+    new_state = dataclasses.replace(elem.state, mean=y)
+    return dataclasses.replace(elem, state=new_state)
+
+
+def _writeback_weights(elem, new_w):
+    """Replace ``weights_in`` on a Layer or LayerStack with ``new_w``."""
+    return dataclasses.replace(elem, weights_in=new_w)
+
+
+# ---------------------------------------------------------------------------
+# Top-level propagation step
+# ---------------------------------------------------------------------------
+
 
 def propagation_step(
-    state: NetworkState,
+    network: Network,
+    opt_state: optax.OptState,
     inputs: tuple,
-    coupling_fns: list[Callable],
-    coupling_fn_grads: list[Callable],
-    add_constant_inputs: list[bool],
-    lr: Union[float, str],
-    layer_kinds: Optional[list[str]] = None,
-    adam_params: Optional[tuple[float, float, float, Optional[float]]] = None,
-    update_type: str = "eHGF",
-    volatility_parents: Optional[list[bool]] = None,
+    *,
+    optimizer: optax.GradientTransformation,
+    time_step: float = 1.0,
     learning_kind: str = "precision_weighted",
     weight_update: bool = True,
-    max_posterior_precision: float = 1e10,
-    conv_specs: Optional[list] = None,
-    batch_size: int = 1,
-) -> tuple[NetworkState, jnp.ndarray]:
+) -> tuple[tuple[Network, optax.OptState], jnp.ndarray]:
     """Single propagation step through the network.
 
-    This performs a full inference-then-learning cycle for one data sample:
-    prediction, prediction-error computation, posterior update, and weight update.
+    Belief-propagation sweep (top-down prediction → leaf PE → interleaved
+    posterior/PE bottom-up) followed by an optional weight-learning phase. Each step
+    dispatches per element on ``Layer`` vs ``LayerStack``:
+
+    * ``Layer`` → standard per-layer kernel call (unrolled).
+    * ``LayerStack`` → ``jax.lax.scan`` over the stack's slices.
+
+    Top and bottom elements must be ``Layer``s. A ``LayerStack``'s child below (and
+    parent above) can themselves be ``Layer`` or ``LayerStack``; the stack-stack case
+    requires the boundary widths to match.
 
     Parameters
     ----------
-    state :
-        Current network state.
+    network :
+        The current vectorised network state.
+    opt_state :
+        The current optax optimiser state.
     inputs :
-        Tuple ``(x, y)`` of input (predictor) and output (observation) vectors.
-    coupling_fns :
-        Per-layer coupling functions.  ``coupling_fns[i]`` is applied to
-        ``layer[i].expected_mean`` when layer *i* acts as a parent.
-    coupling_fn_grads :
-        Gradients of the coupling functions (same indexing as *coupling_fns*).
-    add_constant_inputs :
-        Per-layer flags indicating whether a bias term is added.
-    lr :
-        Learning rate: a non-negative float for direct scaling, or ``"adam"``
-        for the Adam optimiser.
-    layer_kinds :
-        Per-layer node type (``"volatile"`` or ``"binary"``).  Defaults to
-        all ``"volatile"`` when *None*.
-    adam_params :
-        Tuple ``(beta1, beta2, epsilon, lr_override)`` for Adam optimiser.
-        ``lr_override`` is an optional Adam-specific learning rate that overrides the
-        main *lr* argument.  When *None*, Adam is not used.
-    volatility_parents :
-        Per-layer flag controlling whether the implied internal volatility parent
-        is active.  When ``True`` (default), mean_vol and precision_vol are
-        predicted and updated for that layer.  When ``False``, the volatility
-        level is frozen and only tonic_volatility determines the expected
-        precision.  Defaults to all ``True`` when *None*.
+        A tuple ``(x, y)`` with the predictors set on the top element and the
+        observations clamped on the bottom element.
+    optimizer :
+        The optax optimiser used for the weight-learning phase.
+    time_step :
+        The time elapsed since the previous step.
     learning_kind :
-        Gradient computation mode passed to :func:`vectorized_weight_update`:
-        ``"standard"``, ``"precision_weighted"`` (default), or ``"precision_ratio"``.
+        The weight-gradient mode passed to
+        :py:func:`pyhgf.updates.vectorized.learning.vectorized_weight_gradient`.
     weight_update :
-        If ``True`` (default), run the weight-learning phase at the end of the
-        step. If ``False``, weights and Adam moments are passed through
-        unchanged — useful for inference-only forward passes through a fixed
-        network.
-    max_posterior_precision :
-        Upper bound applied to every posterior precision write (value level via
-        :func:`vectorized_layer_posterior_update` and volatility level via
-        :func:`vectorized_layer_prediction_error`). Default ``1e10``.
-    conv_specs :
-        Per-layer conv spec dicts (``None`` for FC layers). Required when any
-        ``layer_kinds`` element is ``"conv"``.
-    batch_size :
-        Number of samples over which gradients are accumulated before applying
-        a single weight update.  ``1`` (default) recovers the original
-        per-sample update behaviour.  Must be a compile-time constant (captured
-        at JIT trace time).
+        Whether to apply the weight-learning phase after belief propagation.
 
     Returns
     -------
-    new_state :
-        Updated network state.
-    output_pred :
-        Output layer prediction (expected mean).
+    carry :
+        A tuple ``((network, opt_state), surprise)`` where `network` and
+        `opt_state` are updated and `surprise` is the step's surprise.
     """
     x, y = inputs
-    layers = list(state.layers)
-    weights = list(state.weights)
-    params = list(state.params)
+    elements = list(network.layers)
+    n_elements = len(elements)
+    max_posterior_precision = network.max_posterior_precision
+    volatility_updates = network.volatility_updates
+    precision_clipping_value = network.precision_clipping_value
 
-    n_layers = len(layers)
+    # 1. Set predictors on the top element.
+    elements[-1] = _set_top_predictors(elements[-1], x)
 
-    # Default: all volatile layers
-    if layer_kinds is None:
-        layer_kinds = ["volatile"] * n_layers
+    # 2. Clamp observations on the bottom element.
+    elements[0] = _set_bottom_observations(elements[0], y)
 
-    # Default: all layers have an implied volatility parent
-    if volatility_parents is None:
-        volatility_parents = [True] * n_layers
-
-    # Default: no conv layers
-    if conv_specs is None:
-        conv_specs = [None] * n_layers
-
-    # 1. Set predictors (top layer = input)
-    layers[-1] = layers[-1]._replace(expected_mean=x, mean=x)
-
-    # 2. Set observations (bottom layer = output)
-    layers[0] = layers[0]._replace(mean=y)
-
-    # 3. Prediction: top-down (using current parent means)
-    for i in range(n_layers - 1, 0, -1):
-        if layer_kinds[i - 1] == "conv":
-            spec = conv_specs[i - 1]
-            layers[i - 1] = vectorized_conv_prediction(
-                child_state=layers[i - 1],
-                parent_state=layers[i],
-                kernel=weights[i - 1][0],
-                bias=weights[i - 1][1],
-                params=params[i - 1],
-                time_step=state.time_step,
-                coupling_fn=coupling_fns[i],
-                stride=spec["stride"],
-                padding=spec["padding"],
-                pool=spec["pool"],
-                pool_size=spec["pool_size"],
-                pool_stride=spec["pool_stride"],
-            )
-        elif layer_kinds[i - 1] == "binary":
-            layers[i - 1] = vectorized_binary_prediction(
-                child_state=layers[i - 1],
-                parent_state=layers[i],
-                weights=weights[i - 1],
-                coupling_fn=coupling_fns[i],
-                parent_has_constant=add_constant_inputs[i],
-            )
-        else:
-            layers[i - 1] = vectorized_layer_prediction(
-                child_state=layers[i - 1],
-                parent_state=layers[i],
-                weights=weights[i - 1],
-                params=params[i - 1],
-                time_step=state.time_step,
-                coupling_fn=coupling_fns[i],
-                parent_has_constant=add_constant_inputs[i],
-                has_volatility_parent=volatility_parents[i - 1],
-            )
-
-    # Step 4a: PE for output layer (mean = y, observation-pinned)
-    if layer_kinds[0] == "binary":
-        layers[0] = vectorized_binary_prediction_error(layer=layers[0])
-    else:
-        layers[0] = vectorized_layer_prediction_error(
-            layer=layers[0],
-            params=params[0],
-            update_type=update_type,
-            has_volatility_parent=volatility_parents[0],
+    # 3. Top-down prediction: predict each element from the one above.
+    for i in range(n_elements - 1, 0, -1):
+        elements[i - 1] = _topdown_predict(
+            elements[i],
+            elements[i - 1],
+            time_step=time_step,
+            precision_clipping_value=precision_clipping_value,
         )
 
-    # Step 4b: per hidden layer — posterior then PE (interleaved)
-    for i in range(1, n_layers - 1):
-        if layer_kinds[i] == "conv":
-            # Gradient-based one-step posterior update for conv parent layers
-            w_child = weights[i - 1]
-            if isinstance(w_child, tuple):
-                # Child is also conv → use conv_transpose gradient
-                spec = conv_specs[i - 1]
-                layers[i] = vectorized_conv_parent_posterior_from_conv(
-                    parent_state=layers[i],
-                    child_state=layers[i - 1],
-                    kernel=w_child[0],
-                    bias=w_child[1],
-                    coupling_fn=coupling_fns[i],
-                    stride=spec["stride"],
-                    padding=spec["padding"],
-                    pool=spec["pool"],
-                    pool_size=spec["pool_size"],
-                    pool_stride=spec["pool_stride"],
-                )
-            else:
-                # Child is FC → use FC matrix transpose
-                layers[i] = vectorized_conv_parent_posterior_from_fc(
-                    parent_state=layers[i],
-                    child_state=layers[i - 1],
-                    fc_weights=w_child,
-                    coupling_fn=coupling_fns[i],
-                    add_constant_input=add_constant_inputs[i],
-                )
-            layers[i] = vectorized_layer_prediction_error(
-                layer=layers[i],
-                params=params[i],
-                update_type=update_type,
-                has_volatility_parent=False,  # conv always has no volatility parent
-            )
-        else:
-            layers[i] = vectorized_layer_posterior_update(
-                layer=layers[i],
-                child=layers[i - 1],
-                weights=weights[i - 1],
-                coupling_fn_grad=coupling_fn_grads[i],
-                parent_has_constant=add_constant_inputs[i],
-            )
-            # Recompute PE and update volatility level so the layer
-            # above receives the correct (post-posterior) error signal.
-            if layer_kinds[i] == "binary":
-                layers[i] = vectorized_binary_prediction_error(layer=layers[i])
-            else:
-                layers[i] = vectorized_layer_prediction_error(
-                    layer=layers[i],
-                    params=params[i],
-                    update_type=update_type,
-                    has_volatility_parent=volatility_parents[i],
-                )
-
-    # ========== LEARNING PHASE ==========
-    # Gradients are accumulated over ``batch_size`` samples; a single averaged
-    # weight update is applied every ``batch_size`` steps via jax.lax.cond.
-    # When ``batch_size=1`` the condition is always true → identical to the
-    # original per-sample behaviour.
-
-    # Resolve Adam hyper-parameters (needed inside the cond branches).
-    if adam_params is not None:
-        beta1, beta2, epsilon, _adam_lr_override = adam_params
-        _adam_lr = _adam_lr_override if _adam_lr_override is not None else 1e-3
-    else:
-        beta1, beta2, epsilon, _adam_lr = 0.9, 0.999, 1e-8, 1e-3
-
-    adam_m_list = list(state.adam_m)
-    adam_v_list = list(state.adam_v)
-    accum_list = list(state.grad_accum)
-    new_grad_step = state.grad_step + 1 if weight_update else state.grad_step
-
-    if weight_update:
-        # --- 1. Compute raw gradient for each weight layer this sample -------
-        raw_grads = []
-        for i in range(1, n_layers):
-            w = weights[i - 1]
-            if isinstance(w, tuple):
-                spec = conv_specs[i - 1]
-                gk, gb = _compute_conv_gradient(
-                    child_state=layers[i - 1],
-                    parent_state=layers[i],
-                    kernel=w[0],
-                    bias=w[1],
-                    coupling_fn=coupling_fns[i],
-                    stride=spec["stride"],
-                    padding=spec["padding"],
-                    pool=spec["pool"],
-                    pool_size=spec["pool_size"],
-                    pool_stride=spec["pool_stride"],
-                    kind=learning_kind,
-                )
-                raw_grads.append((gk, gb))
-            else:
-                raw_grads.append(_compute_fc_gradient(
-                    parent_state=layers[i],
-                    child_state=layers[i - 1],
-                    coupling_fn=coupling_fns[i],
-                    kind=learning_kind,
-                    parent_has_constant=add_constant_inputs[i],
-                    child_is_binary=(layer_kinds[i - 1] == "binary"),
-                ))
-
-        # --- 2. Accumulate ---------------------------------------------------
-        new_accum = tuple(
-            (a[0] + g[0], a[1] + g[1]) if isinstance(g, tuple) else a + g
-            for a, g in zip(accum_list, raw_grads)
-        )
-
-        # --- 3. Conditionally apply via jax.lax.cond -------------------------
-        # Both branches must return the same pytree structure:
-        #   (weights, adam_m, adam_v, grad_accum, adam_t)
-        # where each element mirrors the corresponding list of per-layer arrays.
-
-        def _apply_branch(carry):
-            accum, ws, ms, vs, t = carry
-            new_t = t + 1  # increment Adam timestep on actual weight-update step
-            new_ws, new_ms, new_vs = [], [], []
-            for w, a, m, v in zip(ws, accum, ms, vs):
-                if isinstance(w, tuple):
-                    avg_gk = a[0] / batch_size
-                    avg_gb = a[1] / batch_size
-                    nw, nm, nv = _apply_conv_gradient(
-                        avg_gk, avg_gb, w[0], w[1], lr,
-                        m, v, new_t, _adam_lr, beta1, beta2, epsilon,
-                    )
-                else:
-                    avg_g = a / batch_size
-                    nw, nm, nv = _apply_fc_gradient(
-                        avg_g, w, lr, m, v, new_t,
-                        _adam_lr, beta1, beta2, epsilon,
-                    )
-                new_ws.append(nw)
-                new_ms.append(nm)
-                new_vs.append(nv)
-            zero_accum = tuple(
-                (jnp.zeros_like(a[0]), jnp.zeros_like(a[1]))
-                if isinstance(a, tuple) else jnp.zeros_like(a)
-                for a in accum
-            )
-            return tuple(new_ws), tuple(new_ms), tuple(new_vs), zero_accum, new_t
-
-        def _skip_branch(carry):
-            accum, ws, ms, vs, t = carry
-            return ws, ms, vs, accum, t
-
-        operand = (
-            new_accum,
-            tuple(weights),
-            tuple(adam_m_list),
-            tuple(adam_v_list),
-            state.adam_t,
-        )
-        new_weights_t, new_ms_t, new_vs_t, final_accum, new_adam_t = jax.lax.cond(
-            new_grad_step % batch_size == 0,
-            _apply_branch,
-            _skip_branch,
-            operand,
-        )
-        weights = list(new_weights_t)
-        adam_m_list = list(new_ms_t)
-        adam_v_list = list(new_vs_t)
-        accum_list = list(final_accum)
-    else:
-        new_adam_t = state.adam_t
-
-    new_state = NetworkState(
-        layers=tuple(layers),
-        weights=tuple(weights),
-        params=tuple(params),
-        time_step=state.time_step,
-        adam_m=tuple(adam_m_list),
-        adam_v=tuple(adam_v_list),
-        adam_t=new_adam_t,
-        grad_accum=tuple(accum_list),
-        grad_step=new_grad_step,
+    # 4a. PE on the bottom (leaf) element.
+    elements[0] = _leaf_pe(
+        elements[0],
+        volatility_updates=volatility_updates,
+        max_posterior_precision=max_posterior_precision,
     )
 
-    output_pred = layers[0].expected_mean
+    # 4b. Interleaved bottom-up: posterior + PE on every interior element.
+    for i in range(1, n_elements - 1):
+        elements[i] = _bottomup_posterior_pe(
+            elements[i],
+            elements[i - 1],
+            volatility_updates=volatility_updates,
+            max_posterior_precision=max_posterior_precision,
+        )
 
-    return new_state, output_pred
+    # 5. Weight learning — same optax flow as before, but element-shaped grads.
+    if weight_update:
+        weights = tuple(elem.weights_in for elem in elements)
+        grads_list: list = [None]  # bottom element has no weights_in
+        for i in range(1, n_elements):
+            grads_list.append(_weight_grad(elements[i], elements[i - 1], learning_kind))
+        grads = tuple(grads_list)
+
+        updates, new_opt_state = optimizer.update(grads, opt_state, weights)
+        new_weights = optax.apply_updates(weights, updates)
+
+        for i, new_w in enumerate(new_weights):
+            if new_w is not None:
+                elements[i] = _writeback_weights(elements[i], new_w)
+    else:
+        new_opt_state = opt_state
+
+    new_network = dataclasses.replace(network, layers=tuple(elements))
+    output_pred = new_network.layers[0].state.expected_mean
+    return (new_network, new_opt_state), output_pred
+
+
+# ---------------------------------------------------------------------------
+# Scan driver + prediction-only sweep (unchanged contract)
+# ---------------------------------------------------------------------------
+
+
+@eqx.filter_jit
+def run_scan(
+    init_carry: tuple,
+    inputs: tuple,
+    optimizer: optax.GradientTransformation,
+    learning_kind: str,
+    weight_update: bool,
+    record: tuple,
+    time_step: float = 1.0,
+) -> tuple:
+    r"""Run ``jax.lax.scan`` over the belief-propagation step.
+
+    Decorated with ``eqx.filter_jit``: arrays in ``init_carry`` / ``inputs``
+    are dynamic; ``optimizer`` / ``learning_kind`` / ``weight_update`` /
+    ``record`` / ``time_step`` are static and form the JIT cache key.
+
+    Parameters
+    ----------
+    init_carry :
+        The initial scan carry, a tuple ``(network, opt_state)``.
+    inputs :
+        The per-step inputs scanned over, a tuple of predictor/observation arrays
+        with a leading time axis.
+    optimizer :
+        The optax optimiser used for the weight-learning phase.
+    learning_kind :
+        The weight-gradient mode passed to
+        :py:func:`pyhgf.updates.vectorized.learning.vectorized_weight_gradient`.
+    weight_update :
+        Whether to apply the weight-learning phase at every step.
+    record :
+        Tuple of ``LayerState`` field names to record at every time step (e.g.
+        ``("expected_mean", "precision")``). An empty tuple disables recording. The scan
+        output is just the per-step ``output_pred``. With a non-empty tuple, the
+        per-step output is ``(traj_step, output_pred)`` where ``traj_step`` is
+        ``dict[field_name, tuple[Array, ...]]`` (one per-element array per field, with
+        ``LayerStack`` elements contributing arrays of shape ``(N, n_nodes)``). After
+        ``scan`` stacks across time, each leaf carries a leading ``(T,)`` axis.
+    time_step :
+        Uniform inference time step :math:`\\Delta t` passed to every
+        ``propagation_step`` call. Defaults to ``1.0``.
+
+    Returns
+    -------
+    ``((final_network, final_opt_state), step_output)`` where ``step_output`` is either
+    the stacked predictions alone (``record == ()``) or a
+    ``(stacked_traj, stacked_predictions)`` tuple.
+    """
+
+    def _scan_body(carry, xs):
+        network, opt_state = carry
+        (new_network, new_opt_state), pred = propagation_step(
+            network,
+            opt_state,
+            xs,
+            optimizer=optimizer,
+            time_step=time_step,
+            learning_kind=learning_kind,
+            weight_update=weight_update,
+        )
+        if record:
+            traj_step = {
+                field: tuple(
+                    getattr(_state_for_record(elem), field)
+                    for elem in new_network.layers
+                )
+                for field in record
+            }
+            return (new_network, new_opt_state), (traj_step, pred)
+        return (new_network, new_opt_state), pred
+
+    return jax.lax.scan(_scan_body, init_carry, inputs)
+
+
+def _state_for_record(elem):
+    """Return the ``LayerState`` to read trajectory fields from.
+
+    For a ``Layer`` this is ``elem.state`` (shape ``(n_nodes,)`` per field). For a
+    ``LayerStack`` it's the stacked state (shape ``(N, n_nodes)`` per field) — the user
+    gets the whole stack's trajectory in one block.
+    """
+    return elem.state
+
+
+@eqx.filter_jit
+def prediction_pass(network: Network, x: jnp.ndarray) -> jnp.ndarray:
+    """Forward-only sweep through the network (no PE / posterior / learning).
+
+    Sets predictors on the top element and runs the top-down prediction pass; returns
+    the bottom element's ``expected_mean``. Used by
+    :meth:`pyhgf.model.DeepNetwork.predict`.
+
+    Parameters
+    ----------
+    network :
+        The current vectorised network state.
+    x :
+        The predictors set on the top element.
+
+    Returns
+    -------
+    expected_mean :
+        The bottom element's ``expected_mean`` after the forward sweep.
+    """
+    elements = list(network.layers)
+    n_elements = len(elements)
+
+    elements[-1] = _set_top_predictors(elements[-1], x)
+
+    for i in range(n_elements - 1, 0, -1):
+        elements[i - 1] = _topdown_predict(
+            elements[i],
+            elements[i - 1],
+            time_step=1.0,
+            precision_clipping_value=network.precision_clipping_value,
+        )
+
+    return elements[0].state.expected_mean

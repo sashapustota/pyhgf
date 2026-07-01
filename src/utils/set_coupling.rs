@@ -1,14 +1,11 @@
 use crate::model::Network;
 
 /// Update the value-coupling strength for a single `(parent, child)` pair.
-pub fn set_coupling(
-    network: &mut Network,
-    parent_idx: usize,
-    child_idx: usize,
-    coupling: f64,
-) {
+pub fn set_coupling(network: &mut Network, parent_idx: usize, child_idx: usize, coupling: f64) {
     // 1. Child side: value_coupling_parents[pos of parent in child's value_parents]
-    if let Some(pos) = network.edges[child_idx].value_parents.as_ref()
+    if let Some(pos) = network.edges[child_idx]
+        .value_parents
+        .as_ref()
         .and_then(|vp| vp.iter().position(|&p| p == parent_idx))
     {
         let couplings = &mut network.attributes.vectors[child_idx].value_coupling_parents;
@@ -18,7 +15,9 @@ pub fn set_coupling(
     }
 
     // 2. Parent side: value_coupling_children[pos of child in parent's value_children]
-    if let Some(pos) = network.edges[parent_idx].value_children.as_ref()
+    if let Some(pos) = network.edges[parent_idx]
+        .value_children
+        .as_ref()
         .and_then(|vc| vc.iter().position(|&c| c == child_idx))
     {
         let couplings = &mut network.attributes.vectors[parent_idx].value_coupling_children;
@@ -46,8 +45,8 @@ pub fn set_coupling_vec(
 mod tests {
     use super::*;
     use crate::model::{
-        AdjacencyLists, Attributes, Network, NodeState, NodeVectors, NodeFnPtrs,
-        NodeTrajectories, UpdateSequence,
+        AdjacencyLists, Attributes, Network, NodeFnPtrs, NodeState, NodeTrajectories, NodeVectors,
+        UpdateSequence,
     };
 
     /// Build a minimal 3-node network:
@@ -57,13 +56,30 @@ mod tests {
     fn make_test_network() -> Network {
         Network {
             attributes: Attributes {
-                states: vec![NodeState::default(), NodeState::default(), NodeState::default()],
-                vectors: vec![
-                    NodeVectors { value_coupling_parents: vec![1.0, 1.0], ..Default::default() },
-                    NodeVectors { value_coupling_children: vec![1.0], ..Default::default() },
-                    NodeVectors { value_coupling_children: vec![1.0], ..Default::default() },
+                states: vec![
+                    NodeState::default(),
+                    NodeState::default(),
+                    NodeState::default(),
                 ],
-                fn_ptrs: vec![NodeFnPtrs::default(), NodeFnPtrs::default(), NodeFnPtrs::default()],
+                vectors: vec![
+                    NodeVectors {
+                        value_coupling_parents: vec![1.0, 1.0],
+                        ..Default::default()
+                    },
+                    NodeVectors {
+                        value_coupling_children: vec![1.0],
+                        ..Default::default()
+                    },
+                    NodeVectors {
+                        value_coupling_children: vec![1.0],
+                        ..Default::default()
+                    },
+                ],
+                fn_ptrs: vec![
+                    NodeFnPtrs::default(),
+                    NodeFnPtrs::default(),
+                    NodeFnPtrs::default(),
+                ],
             },
             edges: vec![
                 AdjacencyLists {
@@ -92,13 +108,19 @@ mod tests {
                 },
             ],
             inputs: vec![0],
-            update_type: "standard".into(),
-            update_sequence: UpdateSequence { predictions: Vec::new(), updates: Vec::new() },
+            volatility_updates: "standard".into(),
+            mean_field_updates: false,
+            update_sequence: UpdateSequence {
+                predictions: Vec::new(),
+                updates: Vec::new(),
+            },
             node_trajectories: NodeTrajectories { nodes: Vec::new() },
             layers: Vec::new(),
             adam_state: None,
             roots: vec![1],
             leafs: vec![0],
+            max_posterior_precision: 1e10,
+            precision_clipping_value: 1e-6,
         }
     }
 
@@ -127,7 +149,10 @@ mod tests {
         let mut net = make_test_network();
         set_coupling(&mut net, 1, 2, 99.0);
 
-        assert_eq!(net.attributes.vectors[0].value_coupling_parents, vec![1.0, 1.0]);
+        assert_eq!(
+            net.attributes.vectors[0].value_coupling_parents,
+            vec![1.0, 1.0]
+        );
         assert_eq!(net.attributes.vectors[1].value_coupling_children, vec![1.0]);
         assert_eq!(net.attributes.vectors[2].value_coupling_children, vec![1.0]);
     }
@@ -156,7 +181,10 @@ mod tests {
     fn test_set_coupling_vec_empty_parents() {
         let mut net = make_test_network();
         set_coupling_vec(&mut net, &[], &[0], 5.0);
-        assert_eq!(net.attributes.vectors[0].value_coupling_parents, vec![1.0, 1.0]);
+        assert_eq!(
+            net.attributes.vectors[0].value_coupling_parents,
+            vec![1.0, 1.0]
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@ Results → conv/results/sweep_cifar_arch.csv
 """
 import csv, os, sys, itertools
 import numpy as np
-import jax.numpy as jnp
+import jax, jax.numpy as jnp
+import optax
 
 ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data", "cifar10")
@@ -57,19 +58,23 @@ def build_network(depth, channels, seed):
         net.add_conv_layer(out_channels=out_ch, kernel_size=3, pool=True,
                            tonic_volatility=TONIC_VOL, tonic_volatility_vol=TONIC_VOL)
     net.add_spatial_input(C=3, H=32, W=32)
-    net.weight_initialisation(strategy="he", seed=seed)
+    net.weight_initialisation("he", key=jax.random.key(seed))
     return net
 
 def evaluate(net):
     preds = np.array(net.predict(jnp.array(X_te)))
     return 100.0 * (np.argmax(preds, axis=1) == y_te).mean()
 
+# fit() compares the optimizer by identity to decide whether to reinit
+# opt_state, so the same instance must be reused across every fit() call.
+OPTIMIZER = optax.sgd(LR)
+
 # ── JIT warm-up ────────────────────────────────────────────────────────────────
 print("JIT warm-up...", flush=True)
 for width_name, channels in WIDTHS.items():
     for depth in DEPTHS:
         _net = build_network(depth, channels, 0)
-        _net.fit(X_tr[:4], Y_tr[:4], lr=LR, learning_kind=KIND)
+        _net.fit(X_tr[:4], Y_tr[:4], optimizer=OPTIMIZER, learning_kind=KIND)
         print(f"  warmed up: depth={depth}  width={width_name}", flush=True)
 print("Done.\n", flush=True)
 
@@ -91,7 +96,7 @@ for combo_i, ((width_name, channels), depth) in enumerate(combos, 1):
     combo_best = 0.0
     for epoch in range(1, EPOCHS + 1):
         perm = sweep_rng.permutation(N_TRAIN)
-        net.fit(X_tr[perm], Y_tr[perm], lr=LR, learning_kind=KIND)
+        net.fit(X_tr[perm], Y_tr[perm], optimizer=OPTIMIZER, learning_kind=KIND)
         acc = evaluate(net)
         combo_best = max(combo_best, acc)
         print(f"  epoch {epoch:>2}/{EPOCHS}  acc={acc:5.2f}%", flush=True)

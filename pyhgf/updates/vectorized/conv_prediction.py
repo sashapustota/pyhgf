@@ -2,12 +2,13 @@
 
 """Convolutional prediction and posterior update for deep predictive coding networks."""
 
+import dataclasses
 from typing import Callable
 
 import jax
 import jax.numpy as jnp
 
-from pyhgf.typing import LayerParams, LayerState
+from pyhgf.typing.vectorised import LayerParams, LayerState
 
 
 def vectorized_conv_prediction(
@@ -94,9 +95,15 @@ def vectorized_conv_prediction(
     expected_precision = 1.0 / (1.0 / child_state.precision + predicted_volatility)
     effective_precision = predicted_volatility * expected_precision
 
-    return child_state._replace(
+    return dataclasses.replace(
+        child_state,
         expected_mean=expected_mean,
         expected_precision=expected_precision,
+        # No AR-volatility chain and no value-coupling variance for conv layers
+        # (volatility_parent=False, no jax.grad-through-conv Laplace term) — the
+        # conditional and marginal predicted precisions coincide, matching the
+        # binary-leaf / is_input_layer convention in the FC prediction path.
+        conditional_expected_precision=expected_precision,
         effective_precision=effective_precision,
         expected_mean_vol=child_state.mean_vol,
         expected_precision_vol=child_state.precision_vol,
@@ -177,7 +184,8 @@ def vectorized_conv_parent_posterior_from_conv(
     )
     posterior_mean = parent_state.expected_mean + step_size * grad
 
-    return parent_state._replace(
+    return dataclasses.replace(
+        parent_state,
         mean=posterior_mean,
         precision=parent_state.expected_precision,
     )
@@ -231,7 +239,8 @@ def vectorized_conv_parent_posterior_from_fc(
     )
     posterior_mean = parent_state.expected_mean + step_size * grad
 
-    return parent_state._replace(
+    return dataclasses.replace(
+        parent_state,
         mean=posterior_mean,
         precision=parent_state.expected_precision,
     )

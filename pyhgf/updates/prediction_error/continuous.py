@@ -45,8 +45,8 @@ def continuous_node_value_prediction_error(
     References
     ----------
     .. [1] Weber, L. A., Waade, P. T., Legrand, N., Møller, A. H., Stephan, K. E., &
-       Mathys, C. (2023). The generalized Hierarchical Gaussian Filter (Version 1).
-       arXiv. https://doi.org/10.48550/ARXIV.2305.10937
+       Mathys, C. (2026). The generalized hierarchical Gaussian filter.
+       doi:10.7554/elife.110174.1
 
     """
     # value prediction error
@@ -95,8 +95,8 @@ def continuous_node_volatility_prediction_error(
     References
     ----------
     .. [1] Weber, L. A., Waade, P. T., Legrand, N., Møller, A. H., Stephan, K. E., &
-       Mathys, C. (2023). The generalized Hierarchical Gaussian Filter (Version 1).
-       arXiv. https://doi.org/10.48550/ARXIV.2305.10937
+       Mathys, C. (2026). The generalized hierarchical Gaussian filter.
+       doi:10.7554/elife.110174.1
 
     """
     # compute the volatility prediction error (VOPE)
@@ -128,22 +128,23 @@ def continuous_node_prediction_error(
 
     See [1]_ for more details.
 
-    Parameters
-    ----------
-    attributes :
-        The attributes of the probabilistic nodes.
     .. note::
         The parameter structure also incorporates the value and volatility coupling
         strength with children and parents (i.e. `"value_coupling_parents"`,
         `"value_coupling_children"`, `"volatility_coupling_parents"`,
         `"volatility_coupling_children"`).
+
+    Parameters
+    ----------
+    attributes :
+        The attributes of the probabilistic nodes.
     node_idx :
         Pointer to the continuous node.
     edges :
         The edges of the probabilistic nodes as a tuple of
-        :py:class:`pyhgf.typing.Indexes`. The tuple has the same length as the node
-        number. For each node, the index lists the value and volatility parents and
-        children.
+        :py:class:`pyhgf.typing.AdjacencyLists`. The tuple has the same length as the
+        node number. For each node, the index lists the value and volatility parents
+        and children.
 
     Returns
     -------
@@ -157,9 +158,8 @@ def continuous_node_prediction_error(
     References
     ----------
     .. [1] Weber, L. A., Waade, P. T., Legrand, N., Møller, A. H., Stephan, K. E., &
-       Mathys, C. (2023). The generalized Hierarchical Gaussian Filter (Version 1).
-       arXiv. https://doi.org/10.48550/ARXIV.2305.10937
-
+       Mathys, C. (2026). The generalized hierarchical Gaussian filter.
+       doi:10.7554/elife.110174.1
     """
     # Store value prediction errors
     # -----------------------------

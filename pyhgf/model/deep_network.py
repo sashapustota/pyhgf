@@ -9,26 +9,32 @@ wise matrix operations instead of per-node updates.
 
 from __future__ import annotations
 
+import dataclasses
 import math
+import os
 from typing import Callable, Optional, Union
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
+import pandas as pd
 
-from pyhgf.typing import LayerParams, LayerState, NetworkState
-from pyhgf.updates.vectorized.binary import vectorized_binary_prediction
-from pyhgf.updates.vectorized.volatile import (
-    vectorized_layer_prediction,
+from pyhgf.typing.vectorised import (
+    Layer,
+    LayerParams,
+    LayerState,
+    Network,
+    stack_layers,
 )
-from pyhgf.utils.vectorized_belief_propagation import propagation_step
+from pyhgf.utils.vectorized_belief_propagation import prediction_pass, run_scan
 from pyhgf.utils.weight_initialisation import (
     he_init,
     orthogonal_init,
     sparse_init,
     xavier_init,
 )
-
 
 def _conv_output_shape(parent_shape: tuple, conv_spec: dict) -> tuple:
     """Compute the output spatial shape of a conv layer.
@@ -81,7 +87,8 @@ def _compute_layer_shapes(
     layer_sizes :
         Per-layer node count (int) — used for FC layers; ignored for conv.
     conv_specs :
-        Per-layer conv spec dict or ``None`` for FC layers.
+        Per-layer conv spec dict (this layer's own definition) or ``None``
+        for FC/binary layers.
     input_shape :
         Spatial shape of the raw input ``(C, H, W)``. Required when any conv
         layer is present.
@@ -110,6 +117,7 @@ def _compute_layer_shapes(
 
     return shapes
 
+
 # Default per-layer parameter values (matching ``LayerParams.create``).
 _LAYER_PARAM_DEFAULTS: dict[str, float] = {
     "tonic_volatility": -4.0,
@@ -118,9 +126,15 @@ _LAYER_PARAM_DEFAULTS: dict[str, float] = {
     "autoconnection_strength_vol": 1.0,
 }
 
-# Names of fields that can be overridden per layer.
-_LAYER_STATE_FIELDS: frozenset[str] = frozenset(LayerState._fields)
-_LAYER_PARAM_FIELDS: frozenset[str] = frozenset(LayerParams._fields)
+# Names of fields that can be overridden per layer (eqx.Modules expose dataclass fields).
+_LAYER_STATE_FIELDS: frozenset[str] = frozenset(LayerState.__dataclass_fields__.keys())
+_LAYER_PARAM_FIELDS: frozenset[str] = frozenset(LayerParams.__dataclass_fields__.keys())
+
+# Minimum identical-layer count for ``add_layer_stack`` to auto-collapse the
+# block into a ``LayerStack`` (i.e. switch the propagation kernels to
+# ``jax.lax.scan``). Below this, the savings on JIT trace cost don't
+# outweigh the scan setup overhead.
+_SCAN_AUTO_THRESHOLD: int = 5
 _LAYER_OVERRIDE_FIELDS: frozenset[str] = _LAYER_STATE_FIELDS | _LAYER_PARAM_FIELDS
 
 
@@ -133,6 +147,18 @@ class DeepNetwork:
     Unlike the standard DeepNetwork which uses per-node updates with Python loops, this
     implementation uses JAX matrix operations to update all nodes in a layer
     simultaneously.
+
+    Parameters
+    ----------
+    coupling_fn :
+        Coupling function applied between layers. Default is linear (identity). This
+        function is applied to parent means before the weighted sum to predict child
+        means.
+    volatility_updates :
+        The type of volatility-level posterior update. Can be ``"unbounded"``
+        (default), ``"eHGF"`` or ``"standard"``.
+    max_posterior_precision :
+        Upper bound applied to every posterior precision write. Defaults to ``1e10``.
 
     Examples
     --------
@@ -165,10 +191,11 @@ class DeepNetwork:
     def __init__(
         self,
         coupling_fn: Callable = lambda x: x,
-        update_type: str = "eHGF",
+        volatility_updates: str = "unbounded",
         max_posterior_precision: float = 1e10,
+        precision_clipping_value: float = 1e-6,
     ):
-        """Initialize a VectorizedDeepNetwork.
+        r"""Initialize a VectorizedDeepNetwork.
 
         Parameters
         ----------
@@ -176,19 +203,28 @@ class DeepNetwork:
             Coupling function applied between layers. Default is linear (identity),
             matching the Rust backend and the Network class. This function is
             applied to parent means before the weighted sum to predict child means.
-        update_type :
-            The type of volatility-level posterior update. Can be ``"eHGF"``
-            (default), ``"standard"`` or ``"unbounded"``. Matches the Network
+        volatility_updates :
+            The type of volatility-level posterior update. Can be ``"unbounded"``
+            (default), ``"eHGF"`` or ``"standard"``. Matches the Network
             class and Rust backend.
         max_posterior_precision :
             Upper bound applied to every posterior precision write (value level and
             volatility level). Defaults to ``1e10`` and is shared with the nodalised
             ``Network`` and the Rust backend. Increase it to relax the cap, or lower it
             to be more conservative against precision blow-up.
+        precision_clipping_value :
+            Bound applied to binary-layer predicted means
+            (``[v, 1 - v]``) so the implied binary precision
+            :math:`\hat{\mu}(1 - \hat{\mu})` never collapses. A larger value (e.g.
+            ``1e-3``, matching TAPAS) stabilises the forward filter in high-volatility
+            regimes; a very small value (default ``1e-6``) avoids flat, zero-gradient
+            plateaus that hurt gradient-based inference. Shared with the nodalised
+            ``Network`` and the Rust backend.
         """
         self.coupling_fn = coupling_fn
-        self.update_type = update_type
+        self.volatility_updates = volatility_updates
         self.max_posterior_precision = float(max_posterior_precision)
+        self.precision_clipping_value = float(precision_clipping_value)
         self.layer_sizes: list[int] = []
         self.layer_kinds: list[str] = []
         # Per-layer overrides for fields of ``LayerState`` and ``LayerParams``.
@@ -198,20 +234,22 @@ class DeepNetwork:
         self.fully_connected: list[bool] = []
         self.coupling_fns: list[Callable] = []  # per-layer coupling functions
         self.volatility_parents: list[bool] = []
-        # Conv support
-        self.conv_specs: list[Optional[dict]] = []  # None for FC, dict for conv
-        self.input_shape: Optional[tuple] = None   # set by add_spatial_input
-        self.state: Optional[NetworkState] = None
-        self.trajectories: Optional[NetworkState] = None
+        # Conv support: per-layer conv spec dict (own definition) or None for
+        # FC/binary layers, and the raw input's spatial shape once declared
+        # via ``add_spatial_input``.
+        self.conv_specs: list[Optional[dict]] = []
+        self.input_shape: Optional[tuple] = None
+        # Indices of consecutive layers to collapse into a ``LayerStack`` at
+        # ``_init_state`` time. Each entry is a ``(start, end_exclusive)`` half-
+        # open interval over ``self.layer_sizes``, populated automatically by
+        # ``add_layer_stack`` when ≥ ``_SCAN_AUTO_THRESHOLD`` identical layers
+        # sit on a compatible (matching-width, non-binary) layer below.
+        self.scan_blocks: list[tuple[int, int]] = []
+        self.state: Optional[Network] = None
+        self.opt_state: Optional[optax.OptState] = None
+        self._optimizer: Optional[optax.GradientTransformation] = None
+        self.trajectories: Optional[Network] = None
         self.predictions: Optional[jnp.ndarray] = None
-        self._propagation_fn: Optional[Callable] = None
-        self._propagation_lr: Optional[Union[float, str]] = None
-        self._propagation_learning_kind: Optional[str] = None
-        self._record_trajectories: bool = False
-        self._propagation_weight_update: bool = True
-        self._propagation_max_posterior_precision: Optional[float] = None
-        self._propagation_batch_size: int = 1
-        self._prediction_fn: Optional[Callable] = None
 
     def add_layer(
         self,
@@ -312,6 +350,14 @@ class DeepNetwork:
             coupling_fn if coupling_fn is not None else self.coupling_fn
         )
         self.volatility_parents.append(volatility_parent)
+        # Eagerly rebuild the Network so ``self.state`` is always queryable
+        # after construction. Cheap for typical depths; only triggers fresh
+        # array allocations, no JIT trace.
+        self.state = self._init_state()
+        # Optimiser state's shape depends on the weights tuple, so invalidate
+        # any previously initialised ``opt_state``.
+        self.opt_state = None
+        self._optimizer = None
         return self
 
     def add_layer_stack(
@@ -324,6 +370,15 @@ class DeepNetwork:
         **kwargs,
     ) -> "DeepNetwork":
         """Add multiple hidden layers at once.
+
+        When the block contains ≥ ``_SCAN_AUTO_THRESHOLD`` (currently 5) identical
+        layers sitting on a matching-width non-binary layer below, the layers are
+        automatically collapsed into a single ``LayerStack`` at network-build time, and
+        the propagation kernels ``jax.lax.scan`` over them with a single trace.
+
+        If any eligibility condition is not met (mixed sizes, fewer than 5 layers, width
+        mismatch with the layer below, direct binary-leaf adjacency, or no layer below),
+        the layers are simply added one by one the usual way.
 
         Parameters
         ----------
@@ -349,6 +404,15 @@ class DeepNetwork:
         VectorizedDeepNetwork
             Self for method chaining.
         """
+        auto_scan = (
+            len(layer_sizes) >= _SCAN_AUTO_THRESHOLD
+            and len(set(layer_sizes)) == 1
+            and len(self.layer_sizes) > 0
+            and self.layer_sizes[-1] == layer_sizes[0]
+            and not (len(self.layer_sizes) == 1 and self.layer_kinds[0] == "binary")
+        )
+
+        start = len(self.layer_sizes)
         for size in layer_sizes:
             self.add_layer(
                 size=size,
@@ -358,6 +422,9 @@ class DeepNetwork:
                 coupling_fn=coupling_fn,
                 **kwargs,
             )
+
+        if auto_scan:
+            self.scan_blocks.append((start, len(self.layer_sizes)))
         return self
 
     def add_conv_layer(
@@ -375,7 +442,7 @@ class DeepNetwork:
         """Add a convolutional layer.
 
         Always uses ``volatility_parent=False`` (only tonic volatility drives
-        precision).  Layers are added output → input, same convention as
+        precision). Layers are added output → input, same convention as
         :meth:`add_layer`.
 
         Parameters
@@ -395,11 +462,11 @@ class DeepNetwork:
         pool_stride :
             Max-pool stride.
         coupling_fn :
-            Per-layer activation function.  Falls back to the network-level
+            Per-layer activation function. Falls back to the network-level
             default when ``None``.
         **kwargs :
-            Per-layer overrides for :class:`~pyhgf.typing.LayerState` or
-            :class:`~pyhgf.typing.LayerParams` fields.
+            Per-layer overrides for :class:`~pyhgf.typing.vectorised.LayerState`
+            or :class:`~pyhgf.typing.vectorised.LayerParams` fields.
 
         Returns
         -------
@@ -433,13 +500,19 @@ class DeepNetwork:
             coupling_fn if coupling_fn is not None else self.coupling_fn
         )
         self.volatility_parents.append(False)
+        # Unlike add_layer, this does NOT eagerly rebuild self.state: until
+        # add_spatial_input sets self.input_shape, _compute_layer_shapes has
+        # no way to know the true parent shape for this (currently topmost)
+        # conv layer, so any conv layer already added below it can't have its
+        # shape correctly resolved yet. self.state stays whatever it was
+        # before this call and is rebuilt once add_spatial_input runs.
         return self
 
     def add_spatial_input(self, C: int, H: int, W: int) -> "DeepNetwork":
         """Add a spatial input layer that holds raw image data.
 
-        Sets :attr:`input_shape` to ``(C, H, W)`` and appends a volatile
-        layer (no conv kernel — it IS the raw input).
+        Sets :attr:`input_shape` to ``(C, H, W)`` and appends a volatile layer
+        (no conv kernel — it IS the raw input).
 
         Parameters
         ----------
@@ -464,34 +537,28 @@ class DeepNetwork:
         self.fully_connected.append(True)
         self.coupling_fns.append(self.coupling_fn)
         self.volatility_parents.append(False)
+        self.state = self._init_state()
+        self.opt_state = None
+        self._optimizer = None
         return self
 
-    def _init_state(self) -> NetworkState:
-        """Initialize network state with uniform weights.
+    def _init_state(self) -> Network:
+        """Initialize network with uniform weights, as an Equinox ``Network`` PyTree.
 
-        All inter-layer weights are set to ``1.0``, matching the DeepNetwork and
-        Rust backends.  Use :meth:`weight_initialisation` after construction to
-        apply Xavier, He, orthogonal, or sparse initialisation.
-
-        Returns
-        -------
-        NetworkState
-            Initialized network state.
+        All inter-layer weights are set to ``1.0``. Use :meth:`weight_initialisation`
+        after construction to apply Xavier, He, orthogonal, or sparse initialisation.
         """
-        layers = []
-        weights = []
-        params = []
+        layers: list[Layer] = []
 
         # Compute actual per-layer shapes (1-D for FC, 3-D for conv/spatial input)
         layer_shapes = _compute_layer_shapes(
             self.layer_sizes, self.conv_specs, self.input_shape
         )
 
-        for i in range(len(self.layer_sizes)):
-            shape = layer_shapes[i]
+        for i, shape in enumerate(layer_shapes):
             overrides = self.layer_overrides[i]
 
-            # Layer state with per-layer overrides (broadcast scalar → shape)
+            # Per-layer state with overrides (broadcast scalar -> shape)
             state = LayerState.create(shape)
             state_overrides = {
                 k: jnp.full(shape, v)
@@ -499,80 +566,100 @@ class DeepNetwork:
                 if k in _LAYER_STATE_FIELDS
             }
             if state_overrides:
-                state = state._replace(**state_overrides)
-            layers.append(state)
+                state = dataclasses.replace(state, **state_overrides)
 
-            # Layer parameters with defaults overridden per layer
+            # Per-layer params with overrides
             param_kwargs = dict(_LAYER_PARAM_DEFAULTS)
             for k, v in overrides.items():
                 if k in _LAYER_PARAM_FIELDS:
                     param_kwargs[k] = v
-            params.append(LayerParams.create(shape=shape, **param_kwargs))
+            params = LayerParams.create(shape, **param_kwargs)
 
-            # Create weights connecting layer[i-1] (child) to layer[i] (parent)
+            # `weights_in` lives on the parent (this Layer); layer 0 has none.
+            weights_in = None
+            conv_spec_tuple = None
             if i > 0:
-                child_shape = layer_shapes[i - 1]
-                parent_shape = shape  # = layer_shapes[i]
-
-                if self.conv_specs[i - 1] is not None:
-                    # Child is a conv layer → weight is a (kernel, bias) tuple
-                    spec = self.conv_specs[i - 1]
-                    in_ch = parent_shape[0]
+                child_spec = self.conv_specs[i - 1]
+                if child_spec is not None:
+                    # Child is a conv layer -> weight is a (kernel, bias) tuple
+                    child_shape = layer_shapes[i - 1]
+                    in_ch = shape[0]
                     out_ch = child_shape[0]
-                    k = spec["kernel_size"]
+                    k = child_spec["kernel_size"]
                     kernel = jnp.ones((out_ch, in_ch, k, k))
                     bias = jnp.zeros(out_ch)
-                    weights.append((kernel, bias))
+                    weights_in = (kernel, bias)
+                    conv_spec_tuple = (
+                        child_spec["stride"],
+                        child_spec["padding"],
+                        child_spec["pool"],
+                        child_spec["pool_size"],
+                        child_spec["pool_stride"],
+                    )
                 else:
-                    # Child is FC → 2-D weight matrix
-                    child_size = child_shape[0]
+                    # Child is FC -> 2-D weight matrix (also covers a conv
+                    # parent whose degenerate (C, 1, 1) output feeds an FC
+                    # child through a dense matrix rather than a real kernel).
+                    prev_size = self.layer_sizes[i - 1]
                     parent_flat = 1
-                    for d in parent_shape:
+                    for d in shape:
                         parent_flat *= d
                     n_parent_cols = parent_flat + (
                         1 if self.add_constant_inputs[i] else 0
                     )
                     if self.fully_connected[i]:
-                        weights.append(jnp.ones((child_size, n_parent_cols)))
+                        weights_in = jnp.ones((prev_size, n_parent_cols))
                     else:
-                        weights.append(jnp.eye(child_size, n_parent_cols))
+                        weights_in = jnp.eye(prev_size, n_parent_cols)
 
-        # Adam moment buffers and gradient accumulators (zeros, matching weight structures)
-        adam_m = tuple(
-            (jnp.zeros_like(w[0]), jnp.zeros_like(w[1]))
-            if isinstance(w, tuple)
-            else jnp.zeros_like(w)
-            for w in weights
-        )
-        adam_v = tuple(
-            (jnp.zeros_like(w[0]), jnp.zeros_like(w[1]))
-            if isinstance(w, tuple)
-            else jnp.zeros_like(w)
-            for w in weights
-        )
-        grad_accum = tuple(
-            (jnp.zeros_like(w[0]), jnp.zeros_like(w[1]))
-            if isinstance(w, tuple)
-            else jnp.zeros_like(w)
-            for w in weights
-        )
+            coupling_fn = self.coupling_fns[i]
+            layers.append(
+                Layer(
+                    state=state,
+                    params=params,
+                    weights_in=weights_in,
+                    coupling_fn=coupling_fn,
+                    add_constant_input=self.add_constant_inputs[i],
+                    has_volatility_parent=self.volatility_parents[i],
+                    is_input_layer=(i == 0),
+                    fully_connected=self.fully_connected[i],
+                    kind=self.layer_kinds[i],
+                    conv_spec=conv_spec_tuple,
+                )
+            )
 
-        return NetworkState(
-            layers=tuple(layers),
-            weights=tuple(weights),
-            params=tuple(params),
-            time_step=1.0,
-            adam_m=adam_m,
-            adam_v=adam_v,
-            adam_t=0,
-            grad_accum=grad_accum,
-            grad_step=0,
+        # Collapse any registered scan blocks (auto-registered by
+        # ``add_layer_stack`` when N≥_SCAN_AUTO_THRESHOLD identical layers were
+        # added) into ``LayerStack`` elements. Blocks are appended in order,
+        # so no sorting is needed.
+        if self.scan_blocks:
+            elements: list = []
+            block_iter = iter(self.scan_blocks)
+            next_block = next(block_iter, None)
+            i = 0
+            while i < len(layers):
+                if next_block is not None and i == next_block[0]:
+                    start, end = next_block
+                    elements.append(stack_layers(layers[start:end]))
+                    i = end
+                    next_block = next(block_iter, None)
+                else:
+                    elements.append(layers[i])
+                    i += 1
+        else:
+            elements = layers
+
+        return Network(
+            layers=tuple(elements),
+            volatility_updates=self.volatility_updates,
+            max_posterior_precision=self.max_posterior_precision,
+            precision_clipping_value=self.precision_clipping_value,
         )
 
     def weight_initialisation(
         self,
         strategy: Optional[str] = None,
-        seed: Optional[int] = None,
+        key: Optional[jax.Array] = None,
         **kwargs,
     ) -> "DeepNetwork":
         """Initialise inter-layer weight matrices.
@@ -580,24 +667,25 @@ class DeepNetwork:
         Parameters
         ----------
         strategy :
-            Initialisation strategy.  One of ``"xavier"``, ``"he"``,
-            ``"orthogonal"``, or ``"sparse"``.  If *None*, weights are left
-            unchanged (all ``1.0``).
-        seed :
-            Optional random seed passed to the initialisation function.
+            Initialisation strategy. One of ``"xavier"``, ``"he"``, ``"orthogonal"``, or
+            ``"sparse"``. If *None*, weights are left unchanged (all ``1.0``).
+        key :
+            ``jax.random.PRNGKey`` controlling the randomness. Defaults to
+            ``jax.random.key(0)``. Replaces the legacy ``seed: int`` argument
+            (breaking change).
         **kwargs
-            Extra keyword arguments forwarded to the initialisation function
-            (e.g. ``gain`` for orthogonal, ``sparsity`` / ``std`` for sparse).
+            Extra keyword arguments forwarded to the initialisation function (e.g.
+            ``gain`` for orthogonal, ``sparsity`` / ``std`` for sparse).
 
         Returns
         -------
-        VectorizedDeepNetwork
+        DeepNetwork
             Self for method chaining.
 
         Raises
         ------
         ValueError
-            If the strategy name is not recognised.
+            If the strategy name is not recognised or no layer has been added.
         """
         if strategy is None:
             return self
@@ -610,7 +698,9 @@ class DeepNetwork:
             )
 
         if self.state is None:
-            self.state = self._init_state()
+            raise ValueError(
+                "Add at least one layer before calling weight_initialisation."
+            )
 
         _init_fns: dict[str, Callable[..., np.ndarray]] = {
             "xavier": xavier_init,
@@ -620,16 +710,24 @@ class DeepNetwork:
         }
         init_fn = _init_fns[strategy]
 
-        new_weights = list(self.state.weights)
-        for i, w in enumerate(new_weights):
-            if isinstance(w, tuple):
+        # Convert the JAX PRNG key to a single integer seed for the
+        # numpy-backed init helpers.
+        if key is None:
+            key = jax.random.key(0)
+        seed = int(jax.random.randint(key, (), 0, 2**31 - 1, dtype=jnp.int32))
+
+        from pyhgf.typing.vectorised import LayerStack
+
+        new_elements = list(self.state.layers)
+        for i, elem in enumerate(new_elements):
+            if elem.weights_in is None:
+                continue
+            if isinstance(elem.weights_in, tuple):
                 # Conv weight: (kernel (out_ch, in_ch, kH, kW), bias (out_ch,))
-                kernel, bias = w
+                kernel, bias = elem.weights_in
                 out_ch, in_ch, kH, kW = kernel.shape
                 fan_in = in_ch * kH * kW
-                rng_k = np.random.default_rng(
-                    seed + i if seed is not None else None
-                )
+                rng_k = np.random.default_rng(seed + i)
                 if strategy in ("he", "orthogonal", "sparse"):
                     std = np.sqrt(2.0 / fan_in)
                     new_k = rng_k.normal(0.0, std, size=kernel.shape).astype(
@@ -637,215 +735,43 @@ class DeepNetwork:
                     )
                 else:  # xavier
                     limit = np.sqrt(6.0 / (fan_in + out_ch))
-                    new_k = rng_k.uniform(
-                        -limit, limit, size=kernel.shape
-                    ).astype(np.float32)
+                    new_k = rng_k.uniform(-limit, limit, size=kernel.shape).astype(
+                        np.float32
+                    )
                 new_b = np.zeros(bias.shape, dtype=np.float32)
-                new_weights[i] = (jnp.array(new_k), jnp.array(new_b))
-            else:
-                n_children, n_parents = w.shape  # (prev_size, size)
+                new_weights = (jnp.array(new_k), jnp.array(new_b))
+            elif isinstance(elem, LayerStack):
+                # Stack has weights_in shape (N, n_child, n_parent[+1]). Use
+                # the same seed for every slice — matches the unrolled init's
+                # "same seed across all layers" semantics (necessary for
+                # byte-parity with the unrolled path; the underlying "all
+                # layers identical at init" pattern is a separate concern).
+                n_slices, n_children, n_parents = elem.weights_in.shape
                 flat = init_fn(n_parents, n_children, seed=seed, **kwargs)
-                new_weights[i] = jnp.array(flat.reshape(w.shape))
+                per_slice = jnp.array(flat.reshape(n_children, n_parents))
+                new_weights = jnp.broadcast_to(
+                    per_slice, (n_slices, n_children, n_parents)
+                )
+            else:
+                n_children, n_parents = elem.weights_in.shape
+                flat = init_fn(n_parents, n_children, seed=seed, **kwargs)
+                new_weights = jnp.array(flat.reshape(elem.weights_in.shape))
+            new_elements[i] = dataclasses.replace(elem, weights_in=new_weights)
 
-        self.state = NetworkState(
-            layers=self.state.layers,
-            weights=tuple(new_weights),
-            params=self.state.params,
-            time_step=self.state.time_step,
-            adam_m=self.state.adam_m,
-            adam_v=self.state.adam_v,
-            adam_t=self.state.adam_t,
-            grad_accum=self.state.grad_accum,
-            grad_step=self.state.grad_step,
-        )
+        self.state = dataclasses.replace(self.state, layers=tuple(new_elements))
         return self
-
-    def _create_propagation_fn(
-        self,
-        lr: Union[float, str],
-        learning_kind: str = "precision_weighted",
-        params: Optional[dict] = None,
-        record_trajectories: bool = False,
-        weight_update: bool = True,
-        batch_size: int = 1,
-    ):
-        """Create the jitted propagation function.
-
-        Parameters
-        ----------
-        lr :
-            How the gradient is applied: a non-negative float for direct scaling, or
-            ``"adam"`` for the Adam optimiser.
-        learning_kind :
-            Gradient computation mode: ``"standard"``, ``"precision_weighted"``
-            (default), or ``"precision_ratio"``.
-        params :
-            Hyper-parameters for the Adam optimiser (``beta1``, ``beta2``, ``epsilon``,
-            ``lr``). Only used when ``lr="adam"``.
-        record_trajectories :
-            If True, the scan output includes the full ``NetworkState`` at every time
-            step (useful for inspection but significantly slower). If False (default),
-            only predictions are accumulated.
-        weight_update :
-            If ``True`` (default), the learning phase updates the weights at the
-            end of each step. If ``False``, weights are frozen — the network
-            performs inference only.
-
-        Returns
-        -------
-        Callable
-            JIT-compiled propagation function.
-        """
-        # Per-layer coupling functions and their gradients.
-        # coupling_fns[i] is applied to layer[i].expected_mean when layer[i]
-        # acts as a parent (i.e. when predicting layer[i-1]).
-        coupling_fns = self.coupling_fns
-        coupling_fn_grads = [jax.grad(lambda x, fn=fn: fn(x)) for fn in coupling_fns]
-        add_constant_inputs = self.add_constant_inputs  # captured for bias updates
-        layer_kinds = self.layer_kinds
-        update_type = self.update_type
-        volatility_parents = self.volatility_parents
-        max_posterior_precision = self.max_posterior_precision
-        conv_specs = self.conv_specs  # per-layer conv spec (None for FC layers)
-
-        # Resolve Adam hyper-parameters when lr="adam".
-        if lr == "adam":
-            p = params or {}
-            adam_params: Optional[tuple[float, float, float, float]] = (
-                p.get("beta1", 0.9),
-                p.get("beta2", 0.999),
-                p.get("epsilon", 1e-8),
-                p.get("lr", 1e-3),
-            )
-        else:
-            adam_params = None
-
-        if record_trajectories:
-
-            def _step(state: NetworkState, inputs):
-                new_state, output_pred = propagation_step(
-                    state,
-                    inputs,
-                    coupling_fns,
-                    coupling_fn_grads,
-                    add_constant_inputs,
-                    lr,
-                    layer_kinds,
-                    adam_params,
-                    update_type,
-                    volatility_parents,
-                    learning_kind,
-                    weight_update,
-                    max_posterior_precision,
-                    conv_specs,
-                    batch_size,
-                )
-                return new_state, (new_state, output_pred)
-
-        else:
-
-            def _step(state: NetworkState, inputs):
-                return propagation_step(
-                    state,
-                    inputs,
-                    coupling_fns,
-                    coupling_fn_grads,
-                    add_constant_inputs,
-                    lr,
-                    layer_kinds,
-                    adam_params,
-                    update_type,
-                    volatility_parents,
-                    learning_kind,
-                    weight_update,
-                    max_posterior_precision,
-                    conv_specs,
-                    batch_size,
-                )
-
-        return jax.jit(_step)
-
-    def _create_prediction_fn(self):
-        """Create the jitted prediction function (forward pass only).
-
-        Returns
-        -------
-        Callable
-            JIT-compiled prediction function.
-        """
-        from pyhgf.updates.vectorized.conv_prediction import vectorized_conv_prediction
-
-        coupling_fns = self.coupling_fns
-        add_constant_inputs = self.add_constant_inputs
-        layer_kinds = self.layer_kinds
-        volatility_parents = self.volatility_parents
-        conv_specs = self.conv_specs
-
-        def prediction_step(state: NetworkState, x):
-            """Forward prediction without learning."""
-            layers = list(state.layers)
-            params = state.params
-
-            n_layers = len(layers)
-
-            # Set input
-            layers[-1] = layers[-1]._replace(expected_mean=x)
-
-            # Top-down prediction
-            for i in range(n_layers - 1, 0, -1):
-                if layer_kinds[i - 1] == "conv":
-                    spec = conv_specs[i - 1]
-                    layers[i - 1] = vectorized_conv_prediction(
-                        child_state=layers[i - 1],
-                        parent_state=layers[i],
-                        kernel=state.weights[i - 1][0],
-                        bias=state.weights[i - 1][1],
-                        params=params[i - 1],
-                        time_step=state.time_step,
-                        coupling_fn=coupling_fns[i],
-                        stride=spec["stride"],
-                        padding=spec["padding"],
-                        pool=spec["pool"],
-                        pool_size=spec["pool_size"],
-                        pool_stride=spec["pool_stride"],
-                    )
-                elif layer_kinds[i - 1] == "binary":
-                    layers[i - 1] = vectorized_binary_prediction(
-                        child_state=layers[i - 1],
-                        parent_state=layers[i],
-                        weights=state.weights[i - 1],
-                        coupling_fn=coupling_fns[i],
-                        parent_has_constant=add_constant_inputs[i],
-                    )
-                else:
-                    layers[i - 1] = vectorized_layer_prediction(
-                        child_state=layers[i - 1],
-                        parent_state=layers[i],
-                        weights=state.weights[i - 1],
-                        params=params[i - 1],
-                        time_step=state.time_step,
-                        coupling_fn=coupling_fns[i],
-                        parent_has_constant=add_constant_inputs[i],
-                        has_volatility_parent=volatility_parents[i - 1],
-                    )
-
-            # Return output layer expected mean
-            return layers[0].expected_mean
-
-        return jax.jit(prediction_step)
 
     def fit(
         self,
         x: Union[np.ndarray, jnp.ndarray],
         y: Union[np.ndarray, jnp.ndarray],
-        lr: Union[float, str] = "adam",
+        optimizer: optax.GradientTransformation,
         learning_kind: str = "precision_weighted",
-        params: Optional[dict] = None,
-        record_trajectories: bool = False,
+        record: Optional[tuple] = None,
         weight_update: bool = True,
-        batch_size: int = 1,
+        time_step: float = 1.0,
     ) -> "DeepNetwork":
-        """Fit network to data.
+        r"""Fit network to data.
 
         Parameters
         ----------
@@ -853,90 +779,74 @@ class DeepNetwork:
             Input data, shape (n_samples, n_input_features).
         y :
             Target data, shape (n_samples, n_output_features).
-        lr :
-            How the gradient is applied:
-
-            - **float ≥ 0** — direct scaling of the gradient.
-            - ``"adam"`` (default) — Adam optimiser; step size set by ``params["lr"]``
-            (default 1e-3).
+        optimizer :
+            Any ``optax.GradientTransformation`` — e.g. ``optax.sgd(0.2)``,
+            ``optax.adam(1e-3)``, or any chain. Migration from the legacy
+            ``lr=`` API: ``lr=0.2`` → ``optimizer=optax.sgd(0.2)``,
+            ``lr="adam"`` → ``optimizer=optax.adam(1e-3)``.
         learning_kind :
-            Gradient computation mode:
-
-            - ``"precision_weighted"`` (default) — gradient is weighted by the child
-            layer's posterior precision before applying *lr*.
-            - ``"standard"`` — raw prediction-error outer product, no precision
-            weighting.
-            - ``"precision_ratio"`` — Kalman-gain rule.
-        params :
-            Hyper-parameters for the Adam optimiser: ``beta1`` (default 0.9), ``beta2``
-            (default 0.999), ``epsilon`` (default 1e-8), and ``lr`` (default 1e-3, the
-            Adam step size).
-        record_trajectories :
-            If True, record the full ``NetworkState`` at every time step (accessible
-            via ``self.trajectories``).  This is useful for inspection but significantly
-            increases memory usage and slows training. Default is False.
+            Gradient computation mode passed to
+            :func:`~pyhgf.updates.vectorized.learning.vectorized_weight_gradient`:
+            ``"standard"``, ``"precision_weighted"`` (default),
+            ``"precision_ratio"``, ``"map_natural"``, or ``"pure_natural"``.
+        record :
+            Tuple of ``LayerState`` field names to record at every time step,
+            e.g. ``("expected_mean", "precision")``. ``None`` (default) skips
+            recording. Use the :data:`~pyhgf.typing.RECORD_ALL` constant
+            for the legacy "record everything" behaviour. The result lands in
+            ``self.trajectories`` as ``dict[field_name, tuple[Array, ...]]``
+            where each per-layer array has a leading ``(T,)`` axis.
         weight_update :
-            If ``True`` (default), the learning phase updates the network's
-            weights at the end of each step. Set to ``False`` to freeze the
-            weights and run only the inference (prediction → PE → posterior)
-            cycle — useful for evaluating a fixed model on new data while
-            still recording trajectories.
-        batch_size :
-            Number of samples over which gradients are accumulated before a
-            single weight update is applied.  ``1`` (default) keeps the
-            original per-sample update behaviour.  Changing this value
-            triggers a JIT retrace.
+            If True (default), the learning phase updates weights each step. If False,
+            weights and ``opt_state`` are frozen. Useful for evaluating a fixed model on
+            new data while still recording trajectories.
+        time_step :
+            Uniform inference time step :math:`\\Delta t` applied at every
+            ``propagation_step``. Replaces the legacy ``net.state.time_step``
+            attribute (``NetworkState`` no longer carries it). Default ``1.0``.
 
         Returns
         -------
-        VectorizedDeepNetwork
-            Self with updated state.
-
-        Raises
-        ------
-        ValueError
-            If *learning_kind* or *lr* is an unrecognised value.
+        DeepNetwork
+            Self with updated state and optimiser state.
         """
-        # Initialize state if needed
         if self.state is None:
-            self.state = self._init_state()
+            raise ValueError("Add at least one layer before calling fit.")
 
-        # Recreate (and retrace) the propagation fn when settings change
-        needs_retrace = (
-            self._propagation_fn is None
-            or self._propagation_lr != lr
-            or self._propagation_learning_kind != learning_kind
-            or self._record_trajectories != record_trajectories
-            or self._propagation_weight_update != weight_update
-            or self._propagation_max_posterior_precision != self.max_posterior_precision
-            or self._propagation_batch_size != batch_size
-        )
-        if needs_retrace:
-            self._propagation_fn = self._create_propagation_fn(
-                lr, learning_kind, params, record_trajectories, weight_update, batch_size
-            )
-            self._propagation_lr = lr
-            self._propagation_learning_kind = learning_kind
-            self._record_trajectories = record_trajectories
-            self._propagation_weight_update = weight_update
-            self._propagation_max_posterior_precision = self.max_posterior_precision
-            self._propagation_batch_size = batch_size
+        # Normalise + validate ``record``. A ``None`` or empty tuple disables
+        # recording. Otherwise each name must be a real ``LayerState`` field.
+        record_tuple: tuple = tuple(record) if record else ()
+        if record_tuple:
+            valid_fields = set(LayerState.__dataclass_fields__.keys())
+            invalid = [f for f in record_tuple if f not in valid_fields]
+            if invalid:
+                raise ValueError(
+                    f"Unknown record field(s) {invalid}. Valid: {sorted(valid_fields)}."
+                )
 
-        # Convert to JAX arrays
+        # Initialise opt_state on first fit, or when the optimiser changes.
+        if self.opt_state is None or self._optimizer is not optimizer:
+            self.opt_state = optimizer.init(self.state.weights_tuple())
+            self._optimizer = optimizer
+
         x = jnp.asarray(x)
         y = jnp.asarray(y)
 
-        # Run scan over data
-        assert self._propagation_fn is not None
-        if record_trajectories:
-            self.state, (self.trajectories, self.predictions) = jax.lax.scan(
-                self._propagation_fn, self.state, (x, y)
-            )
+        (self.state, self.opt_state), step_output = run_scan(
+            (self.state, self.opt_state),
+            (x, y),
+            optimizer,
+            learning_kind,
+            weight_update,
+            record_tuple,
+            float(time_step),
+        )
+
+        if record_tuple:
+            self.trajectories, self.predictions = step_output
         else:
             self.trajectories = None
-            self.state, self.predictions = jax.lax.scan(
-                self._propagation_fn, self.state, (x, y)
-            )
+            self.predictions = step_output
 
         return self
 
@@ -957,37 +867,69 @@ class DeepNetwork:
             Predictions, shape (n_samples, n_output_features) or (n_output_features,).
         """
         if self.state is None:
-            raise ValueError("Network must be fit before predicting.")
+            raise ValueError("Add at least one layer before calling predict.")
 
-        if self._prediction_fn is None:
-            self._prediction_fn = self._create_prediction_fn()
-
-        prediction_fn = self._prediction_fn
         x = jnp.asarray(x)
 
-        # Handle single sample vs batch
+        # Handle single sample vs batch.
         if x.ndim == 1:
-            return prediction_fn(self.state, x)
-        else:
-            # Vectorize over samples
-            return jax.vmap(lambda xi: prediction_fn(self.state, xi))(x)
+            return prediction_pass(self.state, x)
+        return jax.vmap(lambda xi: prediction_pass(self.state, xi))(x)
 
     def reset(self) -> "DeepNetwork":
-        """Reset the network state.
-
-        Returns
-        -------
-        VectorizedDeepNetwork
-            Self with reset state.
-        """
+        """Reset the network state."""
         self.state = self._init_state()
-        self._propagation_fn = None
-        self._propagation_lr = None
-        self._propagation_learning_kind = None
-        self._record_trajectories = False
-        self._propagation_weight_update = True
-        self._prediction_fn = None
+        self.opt_state = None
+        self._optimizer = None
         return self
+
+    def save(self, path: Union[str, os.PathLike]) -> "DeepNetwork":
+        """Serialise ``self.state`` array leaves to ``path``.
+
+        Only the network's array content is written (weights and layer states). Static
+        fields (kinds, flags, coupling functions) and the optimiser state are *not*
+        persisted. The user is expected to rebuild the same topology before calling
+        :meth:`load`.
+        """
+        if self.state is None:
+            raise ValueError("Add at least one layer before saving.")
+        eqx.tree_serialise_leaves(str(path), self.state)
+        return self
+
+    def load(self, path: Union[str, os.PathLike]) -> "DeepNetwork":
+        """Read array leaves from ``path`` back into ``self.state``.
+
+        ``self.state`` must already exist with the same treedef (same layer topology).
+        Typically by recreating the builder before calling ``load``.
+        """
+        if self.state is None:
+            raise ValueError(
+                "Recreate the builder topology (add_layer …) before load()."
+            )
+        self.state = eqx.tree_deserialise_leaves(str(path), self.state)
+        # The optimiser state's shape depends on the loaded weights — clear it.
+        self.opt_state = None
+        self._optimizer = None
+        return self
+
+    def to_pandas(self) -> pd.DataFrame:
+        """Flatten ``self.trajectories`` into a wide-format ``pd.DataFrame``.
+
+        Returns one row per recorded time step and one column per
+        ``(layer, node, field)`` triple, named ``L{layer}_N{node}_{field}``. Only the
+        fields that were passed to ``fit(record=...)`` appear.
+        """
+        if not self.trajectories:
+            raise ValueError(
+                "No recorded trajectories. Pass ``record=(...)`` to ``fit``."
+            )
+        columns: dict[str, np.ndarray] = {}
+        for field, per_layer in self.trajectories.items():
+            for layer_idx, arr in enumerate(per_layer):
+                arr_np = np.asarray(arr)  # (T, n_nodes)
+                for node_idx in range(arr_np.shape[1]):
+                    columns[f"L{layer_idx}_N{node_idx}_{field}"] = arr_np[:, node_idx]
+        return pd.DataFrame(columns)
 
     def plot_layers(
         self,

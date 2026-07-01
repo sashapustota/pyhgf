@@ -26,7 +26,40 @@ def add_continuous_state(
     additional_parameters: dict,
     coupling_fn: tuple[Optional[Callable], ...],
 ):
-    """Add continuous state node(s) to a network."""
+    """Add continuous state node(s) to a network.
+
+    Parameters
+    ----------
+    network :
+        The neural network to which the node(s) are added.
+    n_nodes :
+        The number of identical node(s) to add.
+    value_parents :
+        The value parents of the node(s), as a tuple of indexes and coupling
+        strengths.
+    volatility_parents :
+        The volatility parents of the node(s), as a tuple of indexes and coupling
+        strengths.
+    value_children :
+        The value children of the node(s), as a tuple of indexes and coupling
+        strengths.
+    volatility_children :
+        The volatility children of the node(s), as a tuple of indexes and coupling
+        strengths.
+    node_parameters :
+        A dictionary of parameters overriding the node defaults.
+    additional_parameters :
+        Additional parameters passed as keyword arguments, validated against the
+        node defaults.
+    coupling_fn :
+        The coupling function(s) between the node(s) and their value children.
+        ``None`` implies linear coupling.
+
+    Returns
+    -------
+    network :
+        The updated neural network.
+    """
     node_type = 2
 
     default_parameters = {
@@ -44,6 +77,7 @@ def add_continuous_state(
         "observed": 1,
         "temp": {
             "effective_precision": 0.0,
+            "conditional_expected_precision": 1.0,
             "value_prediction_error": 0.0,
             "volatility_prediction_error": 0.0,
             "current_variance": 1.0,
@@ -84,10 +118,36 @@ def add_volatile_state(
     volatility parent modulates the child's precision, enabling dynamic learning rates
     in predictive coding networks with fewer explicit nodes.
 
-    note::
+    .. note::
         Parameters relative to the volatility level (e.g., "mean_vol",
         "expected_mean_vol", etc.) are included in the node's attributes using the
         suffix "_vol".
+
+    Parameters
+    ----------
+    network :
+        The neural network to which the node(s) are added.
+    n_nodes :
+        The number of identical node(s) to add.
+    value_parents :
+        The value parents of the node(s), as a tuple of indexes and coupling
+        strengths.
+    value_children :
+        The value children of the node(s), as a tuple of indexes and coupling
+        strengths.
+    node_parameters :
+        A dictionary of parameters overriding the node defaults.
+    additional_parameters :
+        Additional parameters passed as keyword arguments, validated against the
+        node defaults.
+    coupling_fn :
+        The coupling function(s) between the node(s) and their value children.
+        ``None`` implies linear coupling.
+
+    Returns
+    -------
+    network :
+        The updated neural network.
     """
     node_type = 6
 
@@ -118,6 +178,7 @@ def add_volatile_state(
         # State
         "temp": {
             "effective_precision": 0.0,
+            "conditional_expected_precision": 1.0,
             "value_prediction_error": 0.0,
             "volatility_prediction_error": 0.0,
             "effective_precision_vol": 0.0,
@@ -154,8 +215,33 @@ def add_constant_state(
 ):
     """Add constant-state (bias) node(s) to a network.
 
-    Constant-state nodes hold a fixed mean of 1.0 and have no prediction or update
-    steps. They can only have children, never parents.
+    Constant-state nodes hold a fixed mean of 1.0 and precision of 1.0 (fully known
+    bias). They are always wired to their children linearly (``coupling_fn`` is forced
+    to ``None``), have no prediction or update steps, and can only have children, never
+    parents.
+
+    Parameters
+    ----------
+    network :
+        The neural network to which the node(s) are added.
+    n_nodes :
+        The number of identical node(s) to add.
+    value_children :
+        The value children of the node(s), as a tuple of indexes and coupling
+        strengths.
+    volatility_children :
+        The volatility children of the node(s), as a tuple of indexes and coupling
+        strengths.
+    node_parameters :
+        A dictionary of parameters overriding the node defaults.
+    coupling_fn :
+        The coupling function(s) between the node(s) and their value children.
+        Forced to ``None`` (linear) for constant-state nodes.
+
+    Returns
+    -------
+    network :
+        The updated neural network.
     """
     # Validate that constant-state nodes cannot have volatility children
     if volatility_children[0] is not None and len(volatility_children[0]) > 0:
@@ -163,14 +249,27 @@ def add_constant_state(
 
     node_type = 0
 
+    # ``expected_precision`` is set to infinity so that the piHGF Laplace
+    # value-coupling term ``(t · α · g'(µ̂))² / π̂_parent`` contributes zero
+    # for the bias parent — matching the JAX vectorised backend, which
+    # concatenates an ``inf`` into the parent-precision vector for the
+    # constant column. (The posterior-level ``precision`` is kept at 1.0
+    # because some downstream code reads it directly without dividing.)
     default_parameters = {
         "mean": 1.0,
         "expected_mean": 1.0,
+        "precision": 1.0,
+        "expected_precision": jnp.inf,
         "value_coupling_children": value_children[1],
     }
 
     # allow caller overrides
     default_parameters.update(node_parameters)
+
+    # Constant-state nodes are always linearly connected to their children;
+    # any caller-supplied coupling function is dropped to preserve the
+    # bias = 1.0 invariant across backends.
+    coupling_fn = tuple(None for _ in coupling_fn)
 
     network = insert_nodes(
         network=network,
@@ -197,7 +296,37 @@ def add_binary_state(
     node_parameters: dict,
     additional_parameters: dict,
 ):
-    """Add binary state node(s) to a network."""
+    """Add binary state node(s) to a network.
+
+    Parameters
+    ----------
+    network :
+        The neural network to which the node(s) are added.
+    n_nodes :
+        The number of identical node(s) to add.
+    value_parents :
+        The value parents of the node(s), as a tuple of indexes and coupling
+        strengths.
+    volatility_parents :
+        The volatility parents of the node(s), as a tuple of indexes and coupling
+        strengths.
+    value_children :
+        The value children of the node(s), as a tuple of indexes and coupling
+        strengths.
+    volatility_children :
+        The volatility children of the node(s), as a tuple of indexes and coupling
+        strengths.
+    node_parameters :
+        A dictionary of parameters overriding the node defaults.
+    additional_parameters :
+        Additional parameters passed as keyword arguments, validated against the
+        node defaults.
+
+    Returns
+    -------
+    network :
+        The updated neural network.
+    """
     # define the type of node that is created
     node_type = 1
 
@@ -238,7 +367,28 @@ def add_ef_state(
     additional_parameters: dict,
     value_children: tuple = (None, None),
 ):
-    """Add exponential family state node(s) to a network."""
+    """Add exponential family state node(s) to a network.
+
+    Parameters
+    ----------
+    network :
+        The neural network to which the node(s) are added.
+    n_nodes :
+        The number of identical node(s) to add.
+    node_parameters :
+        A dictionary of parameters overriding the node defaults.
+    additional_parameters :
+        Additional parameters passed as keyword arguments, validated against the
+        node defaults.
+    value_children :
+        The value children of the node(s), as a tuple of indexes and coupling
+        strengths.
+
+    Returns
+    -------
+    network :
+        The updated neural network.
+    """
     node_type = 3
 
     default_parameters = {
@@ -318,7 +468,26 @@ def add_ef_state(
 def add_categorical_state(
     network: Network, n_nodes: int, node_parameters: dict, additional_parameters: dict
 ) -> Network:
-    """Add categorical state node(s) to a network."""
+    """Add categorical state node(s) to a network.
+
+    Parameters
+    ----------
+    network :
+        The neural network to which the node(s) are added.
+    n_nodes :
+        The number of identical node(s) to add.
+    node_parameters :
+        A dictionary of parameters overriding the node defaults (e.g.
+        ``n_categories``).
+    additional_parameters :
+        Additional parameters passed as keyword arguments, validated against the
+        node defaults.
+
+    Returns
+    -------
+    network :
+        The updated neural network.
+    """
     node_type = 5
 
     if "n_categories" in node_parameters:
@@ -376,7 +545,26 @@ def add_categorical_state(
 def add_dp_state(
     network: Network, n_nodes: int, node_parameters: dict, additional_parameters: dict
 ):
-    """Add a Dirichlet Process node to a network."""
+    """Add a Dirichlet Process node to a network.
+
+    Parameters
+    ----------
+    network :
+        The neural network to which the node(s) are added.
+    n_nodes :
+        The number of identical node(s) to add.
+    node_parameters :
+        A dictionary of parameters overriding the node defaults (e.g.
+        ``batch_size``).
+    additional_parameters :
+        Additional parameters passed as keyword arguments, validated against the
+        node defaults.
+
+    Returns
+    -------
+    network :
+        The updated neural network.
+    """
     node_type = 4
 
     if "batch_size" in additional_parameters.keys():
@@ -421,7 +609,26 @@ def get_couplings(
     value_children: Optional[Union[tuple, list, int]],
     volatility_children: Optional[Union[tuple, list, int]],
 ) -> tuple[tuple, ...]:
-    """Transform coupling parameter into tuple of indexes and strenghts."""
+    """Transform coupling parameter into tuple of indexes and strenghts.
+
+    Parameters
+    ----------
+    value_parents :
+        The value parents, given as a node index, a list of indexes, or a tuple of
+        indexes and coupling strengths.
+    volatility_parents :
+        The volatility parents, in the same format as `value_parents`.
+    value_children :
+        The value children, in the same format as `value_parents`.
+    volatility_children :
+        The volatility children, in the same format as `value_parents`.
+
+    Returns
+    -------
+    couplings :
+        A tuple of ``(indexes, strengths)`` pairs for the value parents, volatility
+        parents, value children and volatility children, in that order.
+    """
     couplings = []
     for indexes in [
         value_parents,
@@ -449,7 +656,23 @@ def get_couplings(
 def update_parameters(
     node_parameters: dict, default_parameters: dict, additional_parameters: dict
 ) -> dict:
-    """Update the default node parameters using keywords args and dictonary."""
+    """Update the default node parameters using keywords args and dictonary.
+
+    Parameters
+    ----------
+    node_parameters :
+        A dictionary of parameters overriding the node defaults.
+    default_parameters :
+        The dictionary of default parameters for the node.
+    additional_parameters :
+        Additional parameters passed as keyword arguments, validated against the
+        default parameters.
+
+    Returns
+    -------
+    parameters :
+        The merged dictionary of node parameters.
+    """
     if bool(additional_parameters):
         # ensure that all passed values are valid keys
         invalid_keys = [
@@ -488,7 +711,40 @@ def insert_nodes(
     volatility_children: tuple = (None, None),
     coupling_fn: tuple[Optional[Callable], ...] = (None,),
 ) -> Network:
-    """Insert a set of parametrised node in a network."""
+    """Insert a set of parametrised node in a network.
+
+    Parameters
+    ----------
+    network :
+        The neural network to which the node(s) are added.
+    n_nodes :
+        The number of identical node(s) to add.
+    node_type :
+        The integer code of the node type (see
+        :py:class:`pyhgf.typing.AdjacencyLists`).
+    node_parameters :
+        The dictionary of attributes assigned to each new node.
+    value_parents :
+        The value parents of the node(s), as a tuple of indexes and coupling
+        strengths.
+    volatility_parents :
+        The volatility parents of the node(s), as a tuple of indexes and coupling
+        strengths.
+    value_children :
+        The value children of the node(s), as a tuple of indexes and coupling
+        strengths.
+    volatility_children :
+        The volatility children of the node(s), as a tuple of indexes and coupling
+        strengths.
+    coupling_fn :
+        The coupling function(s) between the node(s) and their value children.
+        ``None`` implies linear coupling.
+
+    Returns
+    -------
+    network :
+        The updated neural network.
+    """
     # ensure that the set of coupling functions match with the number of child nodes
     if value_children[0] is not None:
         if value_children[0] is None:

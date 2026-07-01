@@ -1,114 +1,72 @@
 # Author: Aleksandrs Baskakovs <aleks@cas.au.dk>
 
-"""Convolutional weight update for deep predictive coding networks."""
+"""Convolutional weight gradient for deep predictive coding networks.
 
-from typing import Callable, Optional, Union
+Only computes the raw descent gradient — matching
+:func:`pyhgf.updates.vectorized.learning.vectorized_weight_gradient`'s calling
+convention and sign. Applying the gradient (Adam/SGD/etc.) is handled generically
+by the ``optax`` optimizer in :func:`pyhgf.utils.vectorized_belief_propagation.
+propagation_step`, the same as every other layer kind.
+"""
+
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
 
-from pyhgf.typing import LayerState
+from pyhgf.typing.vectorised import LayerState
 
 
-def vectorized_conv_weight_update(
-    child_state: LayerState,
+def vectorized_conv_weight_gradient(
     parent_state: LayerState,
+    child_state: LayerState,
     kernel: jnp.ndarray,
     bias: jnp.ndarray,
     coupling_fn: Callable,
-    lr: Union[float, str],
     stride: int = 1,
     padding: str = "SAME",
     pool: bool = False,
     pool_size: int = 2,
     pool_stride: int = 2,
     kind: str = "precision_weighted",
-    adam_m: Optional[tuple] = None,
-    adam_v: Optional[tuple] = None,
-    adam_t: int = 0,
-    adam_lr: float = 1e-3,
-    adam_beta1: float = 0.9,
-    adam_beta2: float = 0.999,
-    adam_epsilon: float = 1e-8,
 ) -> tuple:
-    """Update conv kernel and bias via a proxy-loss gradient.
+    """Descent gradient for a conv kernel/bias connecting a conv child to a conv parent.
 
-    The gradient w.r.t. the kernel is computed using :func:`jax.grad` on a
+    The gradient w.r.t. the kernel/bias is computed using :func:`jax.grad` on a
     proxy free-energy term, which is equivalent to the standard cross-correlation
-    backward pass and correctly handles pooling.
+    backward pass and correctly handles pooling. Sign-flipped to a descent
+    gradient, mirroring :func:`~pyhgf.updates.vectorized.learning.
+    vectorized_weight_gradient` so it composes with ``optax``
+    (``apply_updates(weights, updates)`` performs ``weights + updates``).
 
     Parameters
     ----------
-    child_state :
-        State of the conv child (output feature maps).
     parent_state :
         State of the conv/spatial parent (input feature maps).
+    child_state :
+        State of the conv child (output feature maps).
     kernel :
         Current kernel, shape ``(out_ch, in_ch, kH, kW)``.
     bias :
         Current bias, shape ``(out_ch,)``.
     coupling_fn :
         Activation applied to parent activations before conv.
-    lr :
-        ``float`` for direct gradient scaling, or ``"adam"`` for the Adam
-        optimiser.
     stride, padding, pool, pool_size, pool_stride :
         Conv and pooling hyperparameters.
     kind :
-        Gradient mode: ``"standard"``, ``"precision_weighted"`` (default),
-        or ``"precision_ratio"``.
-    adam_m :
-        Adam first-moment tuple ``(kernel_m, bias_m)``. Required when
-        ``lr="adam"``.
-    adam_v :
-        Adam second-moment tuple ``(kernel_v, bias_v)``.
-    adam_t :
-        Global Adam timestep (pre-incremented).
-    adam_lr, adam_beta1, adam_beta2, adam_epsilon :
-        Adam hyper-parameters.
+        Gradient mode: ``"precision_weighted"`` (default) weights the
+        prediction error by the child's posterior precision; anything else
+        falls back to the unweighted ``"standard"`` gradient. (Conv doesn't yet
+        support the ``precision_ratio``/``map_natural``/``pure_natural`` modes
+        that the generic FC gradient does.)
 
     Returns
     -------
-    new_weights :
-        Tuple ``(new_kernel, new_bias)``.
-    new_adam_m :
-        Updated Adam first moments (or ``None``).
-    new_adam_v :
-        Updated Adam second moments (or ``None``).
+    grad :
+        Descent gradient tuple ``(grad_kernel, grad_bias)``, same shapes as
+        ``(kernel, bias)``. NaN/inf entries are zeroed so optax's moment
+        accumulators stay finite.
     """
-    grad_k, grad_b = _compute_conv_gradient(
-        child_state, parent_state, kernel, bias, coupling_fn,
-        stride, padding, pool, pool_size, pool_stride, kind,
-    )
-    km = adam_m[0] if adam_m is not None else jnp.zeros_like(kernel)
-    bm = adam_m[1] if adam_m is not None else jnp.zeros_like(bias)
-    kv = adam_v[0] if adam_v is not None else jnp.zeros_like(kernel)
-    bv = adam_v[1] if adam_v is not None else jnp.zeros_like(bias)
-    new_weights, new_m, new_v = _apply_conv_gradient(
-        grad_k, grad_b, kernel, bias, lr,
-        (km, bm), (kv, bv), adam_t,
-        adam_lr, adam_beta1, adam_beta2, adam_epsilon,
-    )
-    if lr != "adam":
-        new_m = None
-        new_v = None
-    return new_weights, new_m, new_v
-
-
-def _compute_conv_gradient(
-    child_state: LayerState,
-    parent_state: LayerState,
-    kernel: jnp.ndarray,
-    bias: jnp.ndarray,
-    coupling_fn: Callable,
-    stride: int = 1,
-    padding: str = "SAME",
-    pool: bool = False,
-    pool_size: int = 2,
-    pool_stride: int = 2,
-    kind: str = "precision_weighted",
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Compute raw (grad_kernel, grad_bias) without applying any lr scaling."""
     pe = child_state.mean - child_state.expected_mean
     pe_weighted = pe * child_state.precision if kind == "precision_weighted" else pe
     parent_acts = coupling_fn(parent_state.mean)
@@ -133,47 +91,9 @@ def _compute_conv_gradient(
             )
         return jnp.sum(out * pe_weighted)
 
-    return jax.grad(_proxy, argnums=(0, 1))(kernel, bias)
+    grad_k, grad_b = jax.grad(_proxy, argnums=(0, 1))(kernel, bias)
 
+    grad_k = jnp.where(jnp.isnan(grad_k) | jnp.isinf(grad_k), 0.0, grad_k)
+    grad_b = jnp.where(jnp.isnan(grad_b) | jnp.isinf(grad_b), 0.0, grad_b)
 
-def _apply_conv_gradient(
-    grad_k: jnp.ndarray,
-    grad_b: jnp.ndarray,
-    kernel: jnp.ndarray,
-    bias: jnp.ndarray,
-    lr: Union[float, str],
-    adam_m: tuple,
-    adam_v: tuple,
-    adam_t: int,
-    adam_lr: float = 1e-3,
-    adam_beta1: float = 0.9,
-    adam_beta2: float = 0.999,
-    adam_epsilon: float = 1e-8,
-) -> tuple:
-    """Apply pre-computed conv gradients; always returns (weights, m, v)."""
-    km, bm = adam_m
-    kv, bv = adam_v
-    if lr == "adam":
-        new_km = adam_beta1 * km + (1.0 - adam_beta1) * grad_k
-        new_kv = adam_beta2 * kv + (1.0 - adam_beta2) * grad_k**2
-        km_hat = new_km / (1.0 - adam_beta1**adam_t)
-        kv_hat = new_kv / (1.0 - adam_beta2**adam_t)
-        dk = adam_lr * km_hat / (jnp.sqrt(kv_hat) + adam_epsilon)
-
-        new_bm = adam_beta1 * bm + (1.0 - adam_beta1) * grad_b
-        new_bv = adam_beta2 * bv + (1.0 - adam_beta2) * grad_b**2
-        bm_hat = new_bm / (1.0 - adam_beta1**adam_t)
-        bv_hat = new_bv / (1.0 - adam_beta2**adam_t)
-        db = adam_lr * bm_hat / (jnp.sqrt(bv_hat) + adam_epsilon)
-
-        new_m = (new_km, new_bm)
-        new_v = (new_kv, new_bv)
-    else:
-        dk = float(lr) * grad_k
-        db = float(lr) * grad_b
-        new_m = (km, bm)
-        new_v = (kv, bv)
-
-    dk = jnp.where(jnp.isnan(dk) | jnp.isinf(dk), 0.0, dk)
-    db = jnp.where(jnp.isnan(db) | jnp.isinf(db), 0.0, db)
-    return (kernel + dk, bias + db), new_m, new_v
+    return (-grad_k, -grad_b)
