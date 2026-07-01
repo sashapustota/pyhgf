@@ -66,7 +66,7 @@ def vectorized_binary_prediction(
     if parent_has_constant:
         parent_mean = jnp.concatenate([parent_mean, jnp.ones(1)])
 
-    coupled_parents = coupling_fn(parent_mean)
+    coupled_parents = coupling_fn(parent_mean).ravel()
     logit = jnp.matmul(weights, coupled_parents)
 
     # Sigmoid transform to get binary expected mean

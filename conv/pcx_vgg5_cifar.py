@@ -27,7 +27,7 @@ import pcx.utils as pxu
 import pcx.functional as pxf
 
 RESULTS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-RESULTS_PATH = os.path.join(RESULTS_DIR, "pcx_vgg5_cifar_hardtanh.csv")
+RESULTS_PATH = os.path.join(RESULTS_DIR, "pcx_vgg5_cifar_gelu.csv")
 
 BATCH_SIZE = 128
 NM_EPOCHS  = 50
@@ -54,12 +54,12 @@ class VGG5(pxc.EnergyModule):
              self.act_fn, pxnn.MaxPool2d(kernel_size=2, stride=2)),
             (pxnn.Conv2d(256, 512, kernel_size=(3,3), padding=(1,1)),
              self.act_fn, pxnn.MaxPool2d(kernel_size=2, stride=2)),
-            # Paper Table: last conv has padding=0 → 4×4 → 2×2 → pool → 1×1
-            (pxnn.Conv2d(512, 512, kernel_size=(3,3), padding=(0,0)),
+            # padding=(1,1) → 4×4 stays 4×4 → pool → 2×2
+            (pxnn.Conv2d(512, 512, kernel_size=(3,3), padding=(1,1)),
              self.act_fn, pxnn.MaxPool2d(kernel_size=2, stride=2)),
         ]
         self.classifier_layers = [
-            (pxnn.Linear(512 * 1 * 1, self.nm_classes.get()),),
+            (pxnn.Linear(512 * 2 * 2, self.nm_classes.get()),),
         ]
         self.vodes = (
             [pxc.Vode() for _ in self.feature_layers] +
@@ -105,7 +105,7 @@ def train_on_batch(T, x, y, *, model, optim_w, optim_h):
             _, g = pxf.value_and_grad(
                 pxu.M_hasnot(pxc.VodeParam, frozen=True).to([False, True]),
                 has_aux=True)(energy)(x, model=model)
-        optim_h.step(model, g["model"])
+        optim_h.step(model, g["model"], scale_by=BATCH_SIZE)
     optim_h.clear()
     with pxu.step(model, clear_params=pxc.VodeParam.Cache):
         _, g = pxf.value_and_grad(
@@ -127,7 +127,7 @@ steps_per_epoch = len(X_tr) // BATCH_SIZE
 total_steps     = steps_per_epoch * NM_EPOCHS
 
 # ── Model + optimisers ────────────────────────────────────────────────────────
-model = VGG5(nm_classes=10, act_fn=jax.nn.hard_tanh)
+model = VGG5(nm_classes=10, act_fn=jax.nn.gelu)
 
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=W_LR,

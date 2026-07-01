@@ -24,19 +24,17 @@ from data_utils_cifar import load_cifar10, augment
 from pyhgf.model import DeepNetwork
 
 RESULTS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-RESULTS_PATH = os.path.join(RESULTS_DIR, "conv_hgf_cifar_{}.csv".format("fc" if os.environ.get("USE_FC", "1") != "0" else "nofc"))
+_tag = ("fc" if os.environ.get("USE_FC", "1") != "0" else "nofc") + "_adam_gelu"
+RESULTS_PATH = os.path.join(RESULTS_DIR, f"conv_hgf_cifar_{_tag}.csv")
 
 TONIC_VOL     = -10.0
 TONIC_VOL_VOL = -10.0
-BASE_LR       = 0.0001
+ADAM_LR       = 2.641e-4   # matches PCX W_LR from VGG5_PCN_CE.yaml
 BATCH_SIZE    = 32
-LR            = BASE_LR * BATCH_SIZE   # linear scaling rule: lr ∝ batch_size
 LEARNING_KIND = "standard"
 EPOCHS        = 50
 SEED          = 0
 USE_FC        = os.environ.get("USE_FC", "1") != "0"  # override: USE_FC=0 python ...
-
-leaky_relu = lambda x: jax.nn.leaky_relu(x, negative_slope=0.01)
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 X_tr, y_tr, X_te, y_te = load_cifar10(DATA_DIR)
@@ -45,7 +43,7 @@ Y_tr = np.eye(10, dtype=np.float32)[y_tr]
 
 # ── Network ───────────────────────────────────────────────────────────────────
 def build_network(seed):
-    net = DeepNetwork(coupling_fn=leaky_relu)
+    net = DeepNetwork(coupling_fn=jax.nn.gelu)
     net.add_layer(size=10, kind="binary",
                   tonic_volatility=TONIC_VOL,
                   tonic_volatility_vol=TONIC_VOL_VOL,
@@ -74,15 +72,29 @@ def build_network(seed):
     net.weight_initialisation(strategy="he", seed=seed)
     return net
 
+_X_te_jax = jnp.array(X_te)
+_eval_jit  = {}
+
 def evaluate(net):
-    preds = np.array(net.predict(jnp.array(X_te)))
+    key = id(net)
+    if key not in _eval_jit:
+        if net._prediction_fn is None:
+            net._prediction_fn = net._create_prediction_fn()
+        pf = net._prediction_fn
+        _eval_jit[key] = jax.jit(
+            lambda state, x: jax.vmap(lambda xi: pf(state, xi))(x)
+        )
+    preds = np.array(_eval_jit[key](net.state, _X_te_jax))
     return 100.0 * (np.argmax(preds, axis=1) == y_te).mean()
 
+ADAM_PARAMS = {"lr": ADAM_LR}
+
 # ── JIT warm-up ───────────────────────────────────────────────────────────────
-print(f"LR={LR}  (base={BASE_LR} × batch={BATCH_SIZE})  use_fc={USE_FC}", flush=True)
+print(f"Adam LR={ADAM_LR}  batch={BATCH_SIZE}  use_fc={USE_FC}", flush=True)
 print("JIT warm-up...", flush=True)
 _net = build_network(seed=0)
-_net.fit(X_tr[:4], Y_tr[:4], lr=LR, learning_kind=LEARNING_KIND, batch_size=BATCH_SIZE)
+_net.fit(X_tr[:4], Y_tr[:4], lr="adam", learning_kind=LEARNING_KIND,
+         params=ADAM_PARAMS, batch_size=BATCH_SIZE)
 print("Done.\n", flush=True)
 
 # ── Train ─────────────────────────────────────────────────────────────────────
@@ -103,7 +115,8 @@ with open(RESULTS_PATH, "a", newline="") as f:
 for epoch in range(1, EPOCHS + 1):
     idx = rng.permutation(len(X_tr))
     X_aug = augment(X_tr[idx], rng)
-    net.fit(X_aug, Y_tr[idx], lr=LR, learning_kind=LEARNING_KIND, batch_size=BATCH_SIZE)
+    net.fit(X_aug, Y_tr[idx], lr="adam", learning_kind=LEARNING_KIND,
+            params=ADAM_PARAMS, batch_size=BATCH_SIZE)
     acc = evaluate(net)
     print(f"Epoch {epoch:>2}/{EPOCHS}  acc={acc:.2f}%", flush=True)
     with open(RESULTS_PATH, "a", newline="") as f:

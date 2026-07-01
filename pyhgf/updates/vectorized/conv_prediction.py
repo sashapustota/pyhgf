@@ -167,10 +167,15 @@ def vectorized_conv_parent_posterior_from_conv(
 
     grad = jax.grad(_free_energy)(parent_state.expected_mean)
 
-    # One gradient step, step size = 1 / expected_precision
-    posterior_mean = parent_state.expected_mean + grad / (
-        parent_state.expected_precision + 1e-8
+    # One gradient step.  Step size = 1/expected_precision, clamped to ≤1.0.
+    # Without the clamp, precision decay (driven by large PEs early in training)
+    # causes the step size to grow to ~50×, amplifying gradients and driving
+    # runaway kernel growth.  The clamp keeps the step at its initial value (1.0
+    # when precision=1.0) and only reduces it if precision grows above 1.
+    step_size = jnp.clip(
+        1.0 / (parent_state.expected_precision + 1e-8), 0.0, 1.0
     )
+    posterior_mean = parent_state.expected_mean + step_size * grad
 
     return parent_state._replace(
         mean=posterior_mean,
@@ -221,9 +226,10 @@ def vectorized_conv_parent_posterior_from_fc(
 
     grad = jax.grad(_free_energy)(parent_state.expected_mean)
 
-    posterior_mean = parent_state.expected_mean + grad / (
-        parent_state.expected_precision + 1e-8
+    step_size = jnp.clip(
+        1.0 / (parent_state.expected_precision + 1e-8), 0.0, 1.0
     )
+    posterior_mean = parent_state.expected_mean + step_size * grad
 
     return parent_state._replace(
         mean=posterior_mean,
