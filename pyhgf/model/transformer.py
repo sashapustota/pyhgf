@@ -56,9 +56,12 @@ class MultiHeadAttention(PCModule):
     *between* positions; everywhere else each position is independent.
 
     Forward: every position emits a query, a key, and a value through the
-    Q/K/V parts; each position's attention scores against all *earlier*
-    positions (causal mask) become percentages through a softmax; the values
-    are blended accordingly and pass through the O part.
+    Q/K/V parts; each position's attention scores against the positions it
+    may attend to become percentages through a softmax; the values are
+    blended accordingly and pass through the O part. ``causal=True`` (the
+    default) restricts each position to itself and the earlier ones, as a
+    GPT needs; ``causal=False`` lets every position attend to every other,
+    as encoder-only models (BERT, ViT, JEPA) need.
 
     Backward: the error at the output goes back through O, is re-routed
     across positions by the mixing formula (an error at position ``t`` flows
@@ -77,6 +80,7 @@ class MultiHeadAttention(PCModule):
         n_heads: int = 1,
         *,
         wqkv: Optional[PCModule] = None,
+        causal: bool = True,
     ):
         if wo is None:
             raise ValueError("MultiHeadAttention requires an output part `wo`.")
@@ -95,6 +99,7 @@ class MultiHeadAttention(PCModule):
         self.wo: PCModule = wo
         self.wqkv = wqkv
         self.n_heads = n_heads
+        self.causal = causal
 
     def init_state(self) -> tuple:
         """Return the weight tables' state tuple.
@@ -126,15 +131,21 @@ def _merge_heads(a: jnp.ndarray) -> jnp.ndarray:
 
 
 def _mixing_forward(
-    q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, n_heads: int
+    q: jnp.ndarray,
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    n_heads: int,
+    causal: bool = True,
 ) -> tuple[jnp.ndarray, tuple]:
     """Compute the weight-free attention mixing.
 
     Splits the query/key/value streams into heads, scores every position against the
-    earlier positions (causal mask), softmaxes the scores into attention percentages,
-    and blends the values. Returns the blended context, ``(batch, seq, features)``, and
-    the head-shaped cache the backward pass needs. Plain and unjitted: it is staged into
-    the executor's compiled step.
+    positions it may attend to, softmaxes the scores into attention percentages, and
+    blends the values. With ``causal=True`` (the default, the GPT setting) a position
+    sees only itself and the earlier ones; with ``causal=False`` every position sees
+    every other, the setting encoder-only models need. Returns the blended context,
+    ``(batch, seq, features)``, and the head-shaped cache the backward pass needs. Plain
+    and unjitted: it is staged into the executor's compiled step.
     """
     qh = _split_heads(q, n_heads)
     kh = _split_heads(k, n_heads)
@@ -142,8 +153,9 @@ def _mixing_forward(
 
     seq_len, head_dim = qh.shape[2], qh.shape[-1]
     scores = qh @ kh.transpose(0, 1, 3, 2) / jnp.sqrt(float(head_dim))
-    causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-    scores = jnp.where(causal_mask[None, None] == 0, -jnp.inf, scores)
+    if causal:
+        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+        scores = jnp.where(causal_mask[None, None] == 0, -jnp.inf, scores)
     attn = jax.nn.softmax(scores, axis=-1)
 
     return _merge_heads(attn @ vh), (attn, qh, kh, vh)
@@ -159,6 +171,9 @@ def _mixing_backward(
     percentages (through the softmax, where the row-weighted mean of the incoming error
     is subtracted because each row of percentages sums to one; masked positions carry
     zero attention and drop out automatically).
+
+    The formula reads the mask only through the cached percentages, so it is the same
+    whether the forward pass was causal or bidirectional.
     """
     attn, qh, kh, vh = cache
     head_dim = qh.shape[-1]

@@ -22,7 +22,11 @@ from pyhgf.model import (
 
 
 class EqxAttention(eqx.Module):
-    """Reference causal multi-head self-attention, plain Equinox/autodiff."""
+    """Reference multi-head self-attention, plain Equinox/autodiff.
+
+    Causal by default (the GPT setting); ``causal=False`` gives the
+    bidirectional variant encoder-only models use.
+    """
 
     wq: eqx.nn.Linear
     wk: eqx.nn.Linear
@@ -30,8 +34,9 @@ class EqxAttention(eqx.Module):
     wo: eqx.nn.Linear
     n_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
+    causal: bool = eqx.field(static=True)
 
-    def __init__(self, dim, n_heads, key):
+    def __init__(self, dim, n_heads, key, causal=True):
         k1, k2, k3, k4 = random.split(key, 4)
         self.wq = eqx.nn.Linear(dim, dim, use_bias=False, key=k1)
         self.wk = eqx.nn.Linear(dim, dim, use_bias=False, key=k2)
@@ -39,9 +44,10 @@ class EqxAttention(eqx.Module):
         self.wo = eqx.nn.Linear(dim, dim, use_bias=False, key=k4)
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
+        self.causal = causal
 
     def __call__(self, x):  # x: (T, D)
-        """Apply causal self-attention to a single sequence."""
+        """Apply self-attention to a single sequence."""
         seq_len, dim = x.shape
         q, k, v = jax.vmap(self.wq)(x), jax.vmap(self.wk)(x), jax.vmap(self.wv)(x)
         split = lambda a: a.reshape(seq_len, self.n_heads, self.head_dim).transpose(
@@ -49,8 +55,9 @@ class EqxAttention(eqx.Module):
         )
         q, k, v = split(q), split(k), split(v)
         scores = q @ k.transpose(0, 2, 1) / jnp.sqrt(self.head_dim)
-        mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-        scores = jnp.where(mask[None] == 0, -jnp.inf, scores)
+        if self.causal:
+            mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+            scores = jnp.where(mask[None] == 0, -jnp.inf, scores)
         attn = jax.nn.softmax(scores, axis=-1)
         out = (attn @ v).transpose(1, 0, 2).reshape(seq_len, dim)
         return jax.vmap(self.wo)(out)
@@ -165,6 +172,86 @@ def test_attention_backward_matches_autodiff():
     out, error_in = fused.step(x, error)
     np.testing.assert_allclose(out, oracle_forward, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(error_in, vjp(error)[0], rtol=1e-4, atol=1e-5)
+
+
+def test_bidirectional_attention_matches_autodiff():
+    """``causal=False`` gives exact bidirectional attention, forward and backward.
+
+    The hand-derived mixing formula reads the mask only through the cached attention
+    percentages, so dropping the causal mask should need no change to the backward
+    pass. This pins that: a fully frozen bidirectional composite must reproduce the
+    non-causal Equinox forward, and its routed input error must equal the autodiff of
+    that forward — through both the separate Q/K/V path and the fused ``[q|k|v]`` one.
+    """
+    rng = np.random.default_rng(7)
+    dim, n_heads, seq_len, batch = 16, 4, 8, 3
+    eqx_attn = EqxAttention(dim, n_heads, key=random.key(5), causal=False)
+    x = jnp.asarray(rng.normal(size=(batch, seq_len, dim)).astype("float32"))
+    error = jnp.asarray(rng.normal(size=(batch, seq_len, dim)).astype("float32"))
+
+    def tables():
+        return dict(
+            wq=linear_adapter(eqx_attn.wq),
+            wk=linear_adapter(eqx_attn.wk),
+            wv=linear_adapter(eqx_attn.wv),
+            wo=linear_adapter(eqx_attn.wo),
+        )
+
+    # The identity error_fn turns step() into one forward + one backward pass.
+    separate = FusedPipeline(
+        MultiHeadAttention(**tables(), n_heads=n_heads, causal=False),
+        error_fn=lambda out, e: e,
+    )
+    oracle_forward, vjp = jax.vjp(lambda a: jax.vmap(eqx_attn)(a), x)
+    oracle_error_in = vjp(error)[0]
+
+    out, error_in = separate.step(x, error)
+    np.testing.assert_allclose(out, oracle_forward, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(error_in, oracle_error_in, rtol=1e-4, atol=1e-5)
+
+    # The fused projection path carries the flag too.
+    stacked = eqx.nn.Linear(dim, 3 * dim, use_bias=False, key=random.key(6))
+    stacked = eqx.tree_at(
+        lambda linear: linear.weight,
+        stacked,
+        jnp.concatenate(
+            [eqx_attn.wq.weight, eqx_attn.wk.weight, eqx_attn.wv.weight], axis=0
+        ),
+    )
+    fused = FusedPipeline(
+        MultiHeadAttention(
+            wqkv=linear_adapter(stacked),
+            wo=linear_adapter(eqx_attn.wo),
+            n_heads=n_heads,
+            causal=False,
+        ),
+        error_fn=lambda out, e: e,
+    )
+    out_fused, error_in_fused = fused.step(x, error)
+    np.testing.assert_allclose(out_fused, oracle_forward, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(error_in_fused, oracle_error_in, rtol=1e-4, atol=1e-5)
+
+    # The flag must actually reach the mixing: the default (causal) composite over
+    # the same weights must *not* reproduce the bidirectional forward.
+    causal = FusedPipeline(
+        MultiHeadAttention(**tables(), n_heads=n_heads),
+        error_fn=lambda out, e: e,
+    )
+    out_causal, _ = causal.step(x, error)
+    assert not np.allclose(out_causal, oracle_forward, rtol=1e-3, atol=1e-3)
+
+
+def test_causal_remains_the_default():
+    """Omitting ``causal`` keeps the GPT behaviour every other test relies on."""
+    eqx_attn = EqxAttention(8, 2, key=random.key(11))
+    part = MultiHeadAttention(
+        wq=linear_adapter(eqx_attn.wq),
+        wk=linear_adapter(eqx_attn.wk),
+        wv=linear_adapter(eqx_attn.wv),
+        wo=linear_adapter(eqx_attn.wo),
+        n_heads=2,
+    )
+    assert part.causal is True
 
 
 def test_fused_qkv_matches_separate():

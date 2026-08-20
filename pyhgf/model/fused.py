@@ -220,13 +220,14 @@ def _fused_qkv_attention_core(part: MultiHeadAttention, path: str) -> _Core:
     qkv_core = _core(part.wqkv, f"{path}.wqkv")
     o_core = _core(part.wo, f"{path}.wo")
     n_heads = part.n_heads
+    causal = part.causal
     init_state_pytree = (qkv_core.init_state, o_core.init_state)
 
     def forward(state, x):
         state_qkv, state_o = state
         qkv, cache_qkv = qkv_core.forward(state_qkv, x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
-        ctx, cache_mix = _mixing_forward(q, k, v, n_heads)
+        ctx, cache_mix = _mixing_forward(q, k, v, n_heads, causal)
         y, cache_o = o_core.forward(state_o, ctx)
         return y, (cache_qkv, cache_mix, cache_o)
 
@@ -260,6 +261,7 @@ def _attention_core(part: MultiHeadAttention, path: str) -> _Core:
     if part.wqkv is not None:
         return _fused_qkv_attention_core(part, path)
     n_heads = part.n_heads
+    causal = part.causal
     q_core, k_core, v_core, o_core = (
         _core(child, f"{path}.{name}")
         for name, child in (
@@ -280,7 +282,7 @@ def _attention_core(part: MultiHeadAttention, path: str) -> _Core:
         q, cache_q = q_core.forward(state_q, x)
         k, cache_k = k_core.forward(state_k, x)
         v, cache_v = v_core.forward(state_v, x)
-        ctx, cache_mix = _mixing_forward(q, k, v, n_heads)
+        ctx, cache_mix = _mixing_forward(q, k, v, n_heads, causal)
         y, cache_o = o_core.forward(state_o, ctx)
         return y, (cache_q, cache_k, cache_v, cache_mix, cache_o)
 
