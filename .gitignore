@@ -20,3 +20,10 @@ target*
 .benchmarks/
 pyhgf/*.so
 .python-version
+experiments/data/
+experiments/results/
+
+# Root-level markdown docs (research notes etc.) stay local; the project README
+# is the one exception.
+/*.md
+!/README.md
